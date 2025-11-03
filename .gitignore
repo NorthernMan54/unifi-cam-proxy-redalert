@@ -12,7 +12,9 @@ Unifi/camera_data/settings.json
 *.crt
 
 #ignore test scripts
-test-dev/
+test-dev/*
+!test-dev/parser/
+test-dev/parser/protect_artifacts
 !test-dev/parser/dev_parser_unifi_protect_messages.py
 
 #ignore Debug_Snaps folder
