@@ -13,6 +13,7 @@ Unifi/camera_data/settings.json
 
 #ignore test scripts
 test-dev/
+!test-dev/paser/dev_parser_unifi_protect_messages.py
 
 #ignore Debug_Snaps folder
 debug_snaps
