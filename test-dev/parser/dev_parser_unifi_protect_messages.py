@@ -265,34 +265,47 @@ def _decode_as_args(decode_as: str):
             args += ["-d", f"tcp.port=={p},ssl"]
     return args
 
-def capture_until_hello(*, host, port, key, password, iface="br0",
-                        camera_ip=None, duration=60, keylog_path=None,
-                        save_pcap=None, decode_as="7442"):
+def capture_until_hello(host, port, key, password, iface="br0", camera_ip=None,
+                        duration=60, keylog_path=None, save_pcap=None,
+                        decode_as="7442", post_capture_seconds=3):
     """
-    Starts tcpdump remotely and streams packets locally to tshark until a
-    TLS ServerHello or HTTP 101 Upgrade is detected.
+    Stream remote tcpdump to local tshark until we see ServerHello or HTTP 101 Upgrade,
+    or until 'duration' seconds elapse. Then send SIGINT to tcpdump so the pcap is clean.
     """
-    # Build remote tcpdump
+    import subprocess, threading, shlex, sys, os, time
+
+    # Require tshark locally
+    if not which("tshark"):
+        print("[capture] ERROR: tshark not found on PATH.")
+        return False
+
+    # Build BPF
     bpf = "port 7442"
     if camera_ip:
         bpf += f" and (src host {camera_ip} or dst host {camera_ip})"
-    tcpdump_cmd = f"sudo tcpdump -U -s0 -i {shlex.quote(iface)} -w - '{bpf}'"
+
+    # Remote tcpdump command
+    tcpdump_cmd = f"sudo tcpdump -U -s0 -i {iface} -w - '{bpf}'"
     ssh_cmd = build_ssh_cmd(host, port=port, key=key, password_env=password) + [f"sh -lc {shlex.quote(tcpdump_cmd)}"]
 
-    # Build tshark (decoder + filter)
-    tshark_cmd = [
-        "tshark",
-        "-r", "-", "-l",
-        "-n",
-    ] + _decode_as_args(decode_as) + [
-        "-T", "fields", "-e", "_ws.col.Info",
-        "-Y", 'tls.handshake.type == 2 or (http.response.code == 101 && http.upgrade == "websocket")',
-    ]
+    # Local tshark detector
+    tshark_cmd = ["tshark", "-r", "-", "-l", "-n"]
+    for p in (decode_as.split(",") if decode_as else ["7442"]):
+        p = p.strip()
+        if p.isdigit():
+            tshark_cmd += ["-d", f"tcp.port=={p},ssl"]
     if keylog_path:
         tshark_cmd += ["-o", f"tls.keylog_file:{keylog_path}"]
+    tshark_cmd += [
+        "-T", "fields", "-e", "_ws.col.Info",
+        "-Y", 'tls.handshake.type == 2 or (http.response.code == 101 && http.upgrade == "websocket")'
+    ]
 
-    # Optional pcap tee
-    pcap_out = open(save_pcap, "wb") if save_pcap else None
+    # Optional raw pcap tee
+    pcap_out = None
+    if save_pcap:
+        os.makedirs(os.path.dirname(os.path.abspath(save_pcap)), exist_ok=True)
+        pcap_out = open(save_pcap, "wb")
 
     ssh_proc = subprocess.Popen(ssh_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     tshark_proc = subprocess.Popen(
@@ -300,13 +313,13 @@ def capture_until_hello(*, host, port, key, password, iface="br0",
         text=True, bufsize=1
     )
 
-    detected = False
+    detected = threading.Event()
+    timed_out = threading.Event()
 
-    # Forward tcpdump stdout → tshark stdin (and optionally save locally)
+    # Forward tcpdump bytes -> tshark stdin (+ tee)
     def forwarder():
         try:
-            while True:
-                chunk = ssh_proc.stdout.read(65536)
+            for chunk in iter(lambda: ssh_proc.stdout.read(65536), b""):
                 if not chunk:
                     break
                 if pcap_out:
@@ -318,42 +331,211 @@ def capture_until_hello(*, host, port, key, password, iface="br0",
                     break
         finally:
             if pcap_out:
+                pcap_out.flush()
                 pcap_out.close()
             try:
-                tshark_proc.stdin.close()
+                if tshark_proc.stdin:
+                    tshark_proc.stdin.close()
             except Exception:
                 pass
 
-    import threading
     threading.Thread(target=forwarder, daemon=True).start()
 
-    print("[capture] Waiting for ServerHello or WebSocket Upgrade…")
-    start = time.time()
-    try:
-        while True:
-            line = tshark_proc.stdout.readline()
-            if not line:
-                # give it a little time in case of buffering
-                if (time.time() - start) > duration:
-                    break
-                continue
-            if line.strip():
-                print(f"[capture] Detected: {line.strip()}")
-                detected = True
-                break
-            if (time.time() - start) > duration:
-                break
-    finally:
-        try: ssh_proc.terminate()
-        except Exception: pass
-        try: tshark_proc.terminate()
-        except Exception: pass
+    # Simple timeout watchdog
+    def watchdog():
+        if duration and duration > 0:
+            time.sleep(duration)
+            timed_out.set()
 
-    if not detected:
-        print("[capture] WARNING: No ServerHello/Upgrade detected within timeout.")
-    else:
-        print("[capture] Done (hello seen).")
-    return detected
+    threading.Thread(target=watchdog, daemon=True).start()
+
+    # Watch detector output
+    print("[capture] Waiting for ServerHello or WebSocket Upgrade…")
+    while True:
+        if timed_out.is_set():
+            print("[capture] Timeout reached.")
+            break
+        line = tshark_proc.stdout.readline()
+        if not line:
+            break
+        if line.strip():
+            print(f"[capture] Detected: {line.strip()}")
+            detected.set()
+            break
+
+    # Grace period to finish current packets if we saw hello
+    if detected.is_set() and post_capture_seconds > 0:
+        time.sleep(post_capture_seconds)
+
+    # Stop tcpdump cleanly on the UDM so the pcap isn't truncated
+    try:
+        pattern = f"tcpdump -U -s0 -i {iface} "
+        # pkill with a safely-quoted pattern
+        stop_cmd = f"pkill -INT -f {shlex.quote(pattern)}"
+        run_ssh(host, f"sh -lc {shlex.quote(stop_cmd)}", port=port, key=key, password_env=password, check=False)
+    except Exception:
+        pass
+
+    # Let processes wind down
+    try:
+        ssh_proc.wait(timeout=3)
+    except Exception:
+        ssh_proc.terminate()
+    try:
+        tshark_proc.wait(timeout=3)
+    except Exception:
+        tshark_proc.terminate()
+
+    print(f"[capture] Done ({'hello seen' if detected.is_set() else 'no hello'}).")
+    return detected.is_set()
+
+def print_first_unifi_jsons(save_pcap_path, keylog_path, decode_as="7442", camera_ip=None,
+                            limit=60, json_only=False, json_out=None,
+                            from_filter=None, to_filter=None):
+    """
+    Discover candidate TLS streams and print up to `limit` JSON messages.
+    If json_only=True, only well-formed JSON objects are emitted.
+    Optional NDJSON sink via `json_out`.
+    """
+    import subprocess, json, re, os, sys
+
+    def run_out(cmd):
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        return proc.stdout  # ignore rc
+
+    base = [
+        "tshark", "-r", save_pcap_path, "-n",
+        "-o", f"tls.keylog_file:{keylog_path}",
+        "-o", "tcp.desegment_tcp_streams:true",
+        "-o", "tls.desegment_ssl_records:true",
+    ]
+    for p in (decode_as.split(",") if decode_as else ["7442"]):
+        p = p.strip()
+        if p.isdigit():
+            base += ["-d", f"tcp.port=={p},tls"]
+
+    def wrap_ip(df):
+        return f"({df}) && ip.addr=={camera_ip}" if camera_ip else df
+
+    discover_filters = [
+        wrap_ip("tls.handshake.type==1 || tls.handshake.type==2"),
+        wrap_ip("ssl.handshake.type==1 || ssl.handshake.type==2"),
+        wrap_ip("tls"), wrap_ip("ssl"),
+    ]
+
+    streams, used_filter, seen = [], None, set()
+    for df in discover_filters:
+        cmd = base + ["-Y", df, "-T", "fields", "-e", "tcp.stream"]
+        out = run_out(cmd)
+        cand = []
+        for line in out.splitlines():
+            s = line.strip()
+            if s.isdigit() and s not in seen:
+                seen.add(s); cand.append(int(s))
+        if cand:
+            streams = cand; used_filter = df; break
+    if not streams:
+        streams = list(range(0, 8))
+        used_filter = "bruteforce(0..7)"
+    print(f"[decode] Candidate streams: {streams} (source={used_filter})")
+
+    # Optional NDJSON sink
+    sink = open(json_out, "w", encoding="utf-8") if json_out else None
+    printed = 0
+
+    # Helper: emit JSON with optional from/to filtering
+    def emit(obj):
+        nonlocal printed
+        if from_filter and obj.get("from") != from_filter:
+            return
+        if to_filter and obj.get("to") != to_filter:
+            return
+        line = json.dumps(obj, ensure_ascii=False)
+        print(line)
+        if sink:
+            sink.write(line + "\n")
+        printed += 1
+
+    # Streaming JSON extractor from follow output
+    brace_re = re.compile(r"[{}]")
+    def scan_follow_text(text):
+        """
+        Yields JSON objects found in text by tracking balanced braces.
+        Strips common framing like '.~.' prefixes before '{'.
+        """
+        buf = []
+        depth = 0
+        for ch in text:
+            if depth == 0:
+                # skip visible framing before a JSON object
+                if ch != "{":
+                    continue
+                buf = ["{"]; depth = 1; continue
+            # inside object
+            buf.append(ch)
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    blob = "".join(buf)
+                    # try JSON decode; ignore failures
+                    try:
+                        obj = json.loads(blob)
+                        yield obj
+                    except Exception:
+                        pass
+                    buf = []
+
+    for stream in streams:
+        if printed >= limit:
+            break
+        follow_cmd = [
+            "tshark", "-r", save_pcap_path, "-q", "-z", f"follow,tls,ascii,{stream}",
+            "-n",
+            "-o", f"tls.keylog_file:{keylog_path}",
+            "-o", "tcp.desegment_tcp_streams:true",
+            "-o", "tls.desegment_ssl_records:true",
+        ]
+        for p in (decode_as.split(",") if decode_as else ["7442"]):
+            p = p.strip()
+            if p.isdigit():
+                follow_cmd += ["-d", f"tcp.port=={p},tls"]
+
+        proc = subprocess.Popen(follow_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            # Collect only the data section: everything between the two "====" blocks.
+            collecting = False
+            for line in proc.stdout:
+                if printed >= limit:
+                    break
+                if line.startswith("==================================================================="):
+                    collecting = not collecting
+                    continue
+                if not collecting:
+                    continue
+                if json_only:
+                    for obj in scan_follow_text(line):
+                        emit(obj)
+                        if printed >= limit:
+                            break
+                else:
+                    # old behavior: best-effort inline { ... } extraction
+                    if "{" in line and "}" in line:
+                        a = line.find("{"); b = line.rfind("}")
+                        if b > a:
+                            try:
+                                obj = json.loads(line[a:b+1])
+                                emit(obj)
+                            except Exception:
+                                pass
+        finally:
+            proc.terminate()
+
+    if sink:
+        sink.close()
+    print(f"[decode] Printed {printed} JSON messages.")
+    return printed
 
 # ---- main flow ----
 def main():
@@ -375,6 +557,11 @@ def main():
     ap.add_argument("--decode-as", default="7442", help="Comma-separated ports to decode as TLS (default: 7442)")
     ap.add_argument("--capture-timeout", type=int, default=60, help="Max seconds to wait for hello (default: 60)")
     ap.add_argument("--save-pcap", default="", help="Optional path to save live capture stream (e.g. ./protect_artifacts/handshake_capture.pcap)")
+    ap.add_argument("--json-only", action="store_true", help="Print only valid JSON objects from decrypted streams")
+    ap.add_argument("--json-out", default="", help="Optional path to write NDJSON of decoded messages")
+    ap.add_argument("--msg-limit", type=int, default=60, help="Max number of JSON messages to print (default: 60)")
+    ap.add_argument("--from-filter", default="", help='Only keep messages with this "from" value (e.g. UniFiVideo)')
+    ap.add_argument("--to-filter", default="", help='Only keep messages with this "to" value (e.g. ubnt_avclient)')
 
     args = ap.parse_args()
     if args.timestamp:
@@ -422,6 +609,26 @@ def main():
         except Exception:
             pass
 
+    # ---- NEW: start capture first, then restart ----
+    hello_seen = False
+    if args.capture_after:
+        save_pcap_path = args.save_pcap or os.path.join(args.keylog_dir, "handshake_capture.pcap")
+        # start capture in a background thread and give it ~1s head start
+        print("[capture] priming live capture before restart …")
+        def do_capture():
+            nonlocal hello_seen
+            hello_seen = capture_until_hello(
+                host=host, port=port, key=key_path, password=password_env,
+                iface=args.iface, camera_ip=(args.camera_ip or None),
+                duration=args.capture_timeout, keylog_path=None,   # keylog not needed to detect hello
+                save_pcap=save_pcap_path, decode_as=args.decode_as,
+                post_capture_seconds=8
+            )
+        import threading, time as _time
+        tcap = threading.Thread(target=do_capture, daemon=True)
+        tcap.start()
+        _time.sleep(1.0)  # let tcpdump reach “listening on”
+
     # 5) Restart + wait active
     print("[svc] restarting unifi-protect …")
     run_ssh(host, "sh -lc 'systemctl daemon-reload; systemctl restart unifi-protect'",
@@ -451,6 +658,7 @@ def main():
     # 9) Optional live capture until Hello
     if args.capture_after:
         save_pcap_path = args.save_pcap or os.path.join(args.keylog_dir, "handshake_capture.pcap")
+
         capture_until_hello(
             host=host,
             port=port,
@@ -459,9 +667,28 @@ def main():
             iface=args.iface,
             camera_ip=(args.camera_ip or None),
             duration=args.capture_timeout,
-            keylog_path=local_path,     # not strictly needed for detection, useful if you want decryption in tshark
+            keylog_path=local_path,
             save_pcap=save_pcap_path,
             decode_as=args.decode_as,
+        )
+
+        # ---- Re-download keylog to ensure latest secrets ----
+        post_log = os.path.join(args.keylog_dir, "unifiprotectsslkeys_after_capture.log")
+        scp_download(host, REMOTE_KEYLOG, post_log, port=port, key=key_path, password_env=password_env)
+        print(f"[fetch] re-downloaded keylog after capture → {post_log}")
+
+        # ---- Decrypt and show first 60 UniFi messages (multi-stream aware) ----
+        print("[decode] Extracting and printing first 60 decrypted UniFi messages across TLS streams…")
+        print_first_unifi_jsons(
+            save_pcap_path,
+            post_log,
+            decode_as=args.decode_as,
+            camera_ip=(args.camera_ip or None),
+            limit=args.msg_limit,
+            json_only=args.json_only,
+            json_out=args.json_out or None,
+            from_filter=(args.from_filter or None),
+            to_filter=(args.to_filter or None),
         )
 
     return 0 if ok else 5
