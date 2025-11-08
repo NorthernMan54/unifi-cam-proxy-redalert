@@ -1,477 +1,410 @@
 #!/usr/bin/env python3
 """
-dev_parser_unifi_protect_messages.py
+ufp_capture_refactor.py  —  single-file, class-based refactor
 
-One-shot utility to:
-  - Ensure UniFi Protect service on UDM/UDM SE is patched with --tls-keylog
-  - Delete any existing remote keylog (to avoid append/duplicates)
-  - Restart service, wait until active
-  - Wait for fresh /tmp/unifiprotectsslkeys.log to reappear and settle
-  - Download it to a local directory
-  - Verify local hash matches the post-restart remote snapshot
-  - (optional) Start a live capture until TLS ServerHello or HTTP 101 Upgrade is seen
+End-state goals implemented:
+- One remote tcpdump (multi-port BPF), streamed to local
+- Local tshark detects first TLS ServerHello or HTTP 101 Upgrade
+- Fetch TLS key log **only after** hello (TLS 1.3 friendly), with brief settle
+- Decode JSON messages from decrypted streams (balanced-brace extractor)
+- No file hashing; no repeated key pulls (optional refresh hook left for future)
+- Safer process lifecycle; fewer SSH round-trips via batched shell snippets
 
-Auth:
-  - SSH user is hard-coded to 'root'
-  - If env UFP_ROOT_PASS is set and 'sshpass' exists, non-interactive auth is used.
-  - Otherwise it falls back to the normal ssh/scp interactive password prompt.
-
-Example:
-  python3 dev_parser_unifi_protect_messages.py \
-    --host 192.168.0.1 \
-    --keylog-dir ./protect_artifacts \
-    --keylog-timestamp \
-    --capture-after --iface br0 --camera-ip 192.168.0.151 --decode-as 7442 \
-    --save-pcap ./protect_artifacts/handshake_capture.pcap
+Requires: ssh/scp, (optionally) sshpass, tcpdump on remote, tshark locally.
 """
 
+from __future__ import annotations
 import argparse
-import hashlib
+import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
+import threading
 import time
-from datetime import datetime
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable, Iterator, Optional, Tuple
 
-# ---- constants ----
+# ---------- Constants ----------
+SSH_USER = "root"
 REMOTE_SERVICE = "/lib/systemd/system/unifi-protect.service"
-REMOTE_KEYLOG  = "/tmp/unifiprotectsslkeys.log"
-TLS_SENTINEL   = "--tls-keylog /tmp/unifiprotectsslkeys.log"
-SSH_USER       = "root"  # hard-coded
+REMOTE_KEYLOG = "/tmp/unifiprotectsslkeys.log"
 
-# ---- small helpers ----
-def which(prog: str):
+# ---------- Small utils ----------
+def which(name: str) -> Optional[str]:
     from shutil import which as _which
-    return _which(prog)
+    return _which(name)
 
-def sha256_file(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
+def now_utc_stamp() -> str:
+    return time.strftime("%Y%m%d_%H%M%S", time.gmtime())
 
-def ssh_common_opts(port=22, key=None):
-    opts = [
-        "-p", str(port),
-        "-o", "StrictHostKeyChecking=accept-new",
-        "-o", "ControlMaster=auto",
-        "-o", "ControlPersist=90s",
-        "-o", "ControlPath=~/.ssh/cm-%r@%h:%p",
-    ]
-    if key:
-        opts += ["-i", key]
-    return opts
+# ---------- Config ----------
+@dataclass(frozen=True)
+class Config:
+    host: str
+    port: int = 22
+    key: Optional[str] = None
+    keylog_dir: Path = Path("./protect_artifacts")
+    keylog_timestamp: bool = False
+    iface: str = "br0"
+    camera_ip: Optional[str] = None
+    ports: Tuple[int, ...] = (7442,)
+    capture_timeout_s: int = 60
+    post_grace_s: int = 8
+    save_pcap: Optional[Path] = None
+    json_only: bool = False
+    json_out: Optional[Path] = None
+    msg_limit: int = 60
+    from_filter: Optional[str] = None
+    to_filter: Optional[str] = None
+    do_patch: bool = True
+    settle_keylog_s: float = 2.0  # wait for TLS 1.3 secrets to flush
 
-def build_ssh_cmd(host, *, port=22, key=None, password_env=None):
-    """
-    Returns argv for ssh, optionally prefixed with sshpass if:
-      - password_env is set AND
-      - sshpass exists on PATH
-    """
-    base = ["ssh"] + ssh_common_opts(port, key) + [f"{SSH_USER}@{host}"]
-    if password_env and which("sshpass"):
-        return ["sshpass", "-p", password_env] + base
-    return base
+    @staticmethod
+    def from_cli(args: argparse.Namespace) -> "Config":
+        ports = tuple(int(p.strip()) for p in (args.decode_as or "7442").split(",") if p.strip().isdigit())
+        return Config(
+            host=args.host,
+            port=args.port,
+            key=args.key,
+            keylog_dir=Path(args.keylog_dir),
+            keylog_timestamp=args.keylog_timestamp,
+            iface=args.iface,
+            camera_ip=(args.camera_ip or None),
+            ports=ports if ports else (7442,),
+            capture_timeout_s=args.capture_timeout,
+            post_grace_s=8,
+            save_pcap=Path(args.save_pcap) if args.save_pcap else None,
+            json_only=args.json_only,
+            json_out=Path(args.json_out) if args.json_out else None,
+            msg_limit=args.msg_limit,
+            from_filter=(args.from_filter or None),
+            to_filter=(args.to_filter or None),
+            do_patch=(not args.no_patch),
+        )
 
-def build_scp_cmd(host, *, port=22, key=None, password_env=None):
-    base = ["scp",
+# ---------- SSH client ----------
+class SshError(RuntimeError):
+    pass
+
+@dataclass(frozen=True)
+class SshConfig:
+    host: str
+    port: int = 22
+    key: Optional[str] = None
+    password: Optional[str] = None  # UFP_ROOT_PASS if present
+    control_persist_s: int = 90
+    timeout_s: int = 30
+
+class SshClient:
+    def __init__(self, cfg: SshConfig):
+        self.cfg = cfg
+        self._base_ssh = [
+            "ssh",
+            "-p", str(cfg.port),
+            "-o", "StrictHostKeyChecking=accept-new",
             "-o", "ControlMaster=auto",
-            "-o", "ControlPersist=90s",
+            "-o", f"ControlPersist={cfg.control_persist_s}s",
             "-o", "ControlPath=~/.ssh/cm-%r@%h:%p",
-            "-P", str(port)]
-    if key:
-        base += ["-i", key]
-    if password_env and which("sshpass"):
-        return ["sshpass", "-p", password_env] + base
-    return base
+        ]
+        if cfg.key:
+            self._base_ssh += ["-i", cfg.key]
 
-def run_ssh(host, remote_cmd, *, port=22, key=None, password_env=None, check=True):
-    cmd = build_ssh_cmd(host, port=port, key=key, password_env=password_env) + [remote_cmd]
-    try:
-        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
-        return out.decode("utf-8", errors="replace")
-    except subprocess.CalledProcessError as e:
-        if check:
-            try:
-                sys.stderr.write(e.output.decode("utf-8", errors="replace"))
-            except Exception:
-                pass
-            raise
-        return ""
+        self._base_scp = [
+            "scp",
+            "-P", str(cfg.port),
+            "-o", "ControlMaster=auto",
+            "-o", f"ControlPersist={cfg.control_persist_s}s",
+            "-o", "ControlPath=~/.ssh/cm-%r@%h:%p",
+        ]
+        if cfg.key:
+            self._base_scp += ["-i", cfg.key]
 
-def scp_download(host, remote_path, local_path, *, port=22, key=None, password_env=None):
-    os.makedirs(os.path.dirname(os.path.abspath(local_path)), exist_ok=True)
-    cmd = build_scp_cmd(host, port=port, key=key, password_env=password_env) + [
-        f"{SSH_USER}@{host}:{remote_path}",
-        local_path,
-    ]
-    subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+        self._prefix = []
+        if cfg.password and which("sshpass"):
+            self._prefix = ["sshpass", "-p", cfg.password]
 
-def has_tls_sentinel(host, service_path, *, port=22, key=None, password_env=None):
-    """
-    Return (present: bool, line: str) indicating whether the service file's ExecStart line
-    already includes the --tls-keylog flag.
-    """
-    grep_cmd = f"grep -E '^ExecStart=' {service_path} 2>/dev/null || true"
-    out = run_ssh(host, f"sh -lc {shlex.quote(grep_cmd)}",
-                  port=port, key=key, password_env=password_env, check=False).strip()
-    if not out:
-        return False, ""
-    for line in out.splitlines():
-        if "--tls-keylog" in line:
-            return True, line
-    return False, out.splitlines()[0]
-
-def patch_execstart_to_add_tls(host, *, port=22, key=None, password_env=None):
-    script = r'''
-set -e
-FILE="''' + REMOTE_SERVICE + r'''"
-TMP="/tmp/unifi-protect.service.$$"
-[ -f "$FILE" ]
-
-if grep -E '^ExecStart=' "$FILE" | grep -q -- '--tls-keylog'; then
-  echo "Already contains --tls-keylog"
-  exit 0
-fi
-
-awk '
-BEGIN { patched=0 }
-{
-  if ($0 ~ /^ExecStart=/ && $0 ~ /\/usr\/bin\/node20/ && $0 !~ /--tls-keylog/) {
-    gsub(/\/usr\/bin\/node20/, "/usr/bin/node20 --tls-keylog /tmp/unifiprotectsslkeys.log");
-    patched=1
-  }
-  print
-}
-END { if (patched==0) exit 5 }
-' "$FILE" > "$TMP"
-
-install -m 0644 "$TMP" "$FILE"
-rm -f "$TMP"
-'''
-    run_ssh(host, f"sh -lc {shlex.quote(script)}",
-            port=port, key=key, password_env=password_env, check=True)
-
-def daemon_reload(host, *, port=22, key=None, password_env=None):
-    run_ssh(host, "sh -lc 'systemctl daemon-reload'",
-            port=port, key=key, password_env=password_env, check=True)
-
-def wait_service_active(host, *, port=22, key=None, password_env=None, timeout_s=30) -> bool:
-    script = f"""
-set -e
-end=$(( $(date +%s) + {int(timeout_s)} ))
-while [ "$(systemctl is-active unifi-protect || true)" != "active" ]; do
-  [ $(date +%s) -ge $end ] && exit 7
-  sleep 1
-done
-echo active
-""".strip()
-    out = run_ssh(host, f"sh -lc {shlex.quote(script)}",
-                  port=port, key=key, password_env=password_env, check=False).strip()
-    return out == "active"
-
-def remote_stat_keylog(host, *, port=22, key=None, password_env=None):
-    """
-    Return dict {'exists': bool, 'size': int, 'sha256': str} for the remote keylog.
-    Uses stat & sha256sum if available; if sha256sum is missing, sha256 is ''.
-    """
-    # Size
-    size_cmd = f"sh -lc {shlex.quote(f'if [ -f {REMOTE_KEYLOG} ]; then stat -c %s {REMOTE_KEYLOG} 2>/dev/null || busybox stat -c %s {REMOTE_KEYLOG} 2>/dev/null; fi')}"
-    size_out = run_ssh(host, size_cmd, port=port, key=key, password_env=password_env, check=False).strip()
-    exists = bool(size_out)
-    size = int(size_out) if size_out else 0
-
-    if not exists:
-        return {"exists": False, "size": 0, "sha256": ""}
-
-    # Hash
-    hash_cmd = f"sh -lc {shlex.quote(f'(command -v sha256sum >/dev/null 2>&1 && sha256sum {REMOTE_KEYLOG}) || (command -v busybox >/dev/null 2>&1 && busybox sha256sum {REMOTE_KEYLOG}) || echo NOHASH')}"
-    hline = run_ssh(host, hash_cmd, port=port, key=key, password_env=password_env, check=False).strip()
-    if not hline or hline == "NOHASH":
-        return {"exists": True, "size": size, "sha256": ""}
-    return {"exists": True, "size": size, "sha256": hline.split()[0]}
-
-def remove_remote_file(host, path, *, port=22, key=None, password_env=None):
-    run_ssh(host, f"sh -lc {shlex.quote(f'rm -f {path} || true')}",
-            port=port, key=key, password_env=password_env, check=False)
-
-def wait_keylog_recreated_and_settled(host, *, port=22, key=None, password_env=None,
-                                      min_wait=1, settle_window=2, timeout_s=60):
-    """
-    Wait until keylog exists and its size is stable for 'settle_window' seconds.
-    Returns latest {'exists','size','sha256'} or {'exists':False,...} on timeout.
-    """
-    start = time.time()
-    last_size = -1
-    last_change = time.time()
-    time.sleep(max(0, min_wait))
-    while time.time() - start < timeout_s:
-        s = remote_stat_keylog(host, port=port, key=key, password_env=password_env)
-        if s["exists"]:
-            if s["size"] != last_size:
-                last_size = s["size"]
-                last_change = time.time()
-            else:
-                if time.time() - last_change >= settle_window and s["size"] > 0:
-                    return s
-        time.sleep(0.5)
-    return {"exists": False, "size": 0, "sha256": ""}
-
-def same_hash(local_path, remote_sha256):
-    if not remote_sha256:
-        return False
-    if not local_path or not os.path.isfile(local_path):
-        return False
-    return sha256_file(local_path) == remote_sha256
-
-def find_latest_local_path(dirpath: str):
-    """
-    Return the most recently modified local keylog file path matching:
-      - unifiprotectsslkeys_*.log
-      - unifiprotectsslkeys_latest.log
-    or None if none exist.
-    """
-    if not os.path.isdir(dirpath):
-        return None
-    candidates = []
-    for name in os.listdir(dirpath):
-        if not name.startswith("unifiprotectsslkeys_") and name != "unifiprotectsslkeys_latest.log":
-            continue
-        full = os.path.join(dirpath, name)
-        if os.path.isfile(full):
-            candidates.append((os.path.getmtime(full), full))
-    if not candidates:
-        return None
-    candidates.sort(reverse=True)
-    return candidates[0][1]
-
-def build_local_path(dirpath: str, use_timestamp: bool) -> str:
-    os.makedirs(dirpath, exist_ok=True)
-    if use_timestamp:
-        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        return os.path.join(dirpath, f"unifiprotectsslkeys_{ts}.log")
-    else:
-        return os.path.join(dirpath, "unifiprotectsslkeys_latest.log")
-
-# ---- packet capture ----
-
-def _decode_as_args(decode_as: str):
-    args = []
-    ports = [p.strip() for p in (decode_as or "7442").split(",")]
-    for p in ports:
-        if p.isdigit():
-            args += ["-d", f"tcp.port=={p},ssl"]
-    return args
-
-def capture_until_hello(host, port, key, password, iface="br0", camera_ip=None,
-                        duration=60, keylog_path=None, save_pcap=None,
-                        decode_as="7442", post_capture_seconds=3):
-    """
-    Stream remote tcpdump to local tshark until we see ServerHello or HTTP 101 Upgrade,
-    or until 'duration' seconds elapse. Then send SIGINT to tcpdump so the pcap is clean.
-    """
-    import subprocess, threading, shlex, sys, os, time
-
-    # Require tshark locally
-    if not which("tshark"):
-        print("[capture] ERROR: tshark not found on PATH.")
-        return False
-
-    # Build BPF
-    bpf = "port 7442"
-    if camera_ip:
-        bpf += f" and (src host {camera_ip} or dst host {camera_ip})"
-
-    # Remote tcpdump command
-    tcpdump_cmd = f"sudo tcpdump -U -s0 -i {iface} -w - '{bpf}'"
-    ssh_cmd = build_ssh_cmd(host, port=port, key=key, password_env=password) + [f"sh -lc {shlex.quote(tcpdump_cmd)}"]
-
-    # Local tshark detector
-    tshark_cmd = ["tshark", "-r", "-", "-l", "-n"]
-    for p in (decode_as.split(",") if decode_as else ["7442"]):
-        p = p.strip()
-        if p.isdigit():
-            tshark_cmd += ["-d", f"tcp.port=={p},ssl"]
-    if keylog_path:
-        tshark_cmd += ["-o", f"tls.keylog_file:{keylog_path}"]
-    tshark_cmd += [
-        "-T", "fields", "-e", "_ws.col.Info",
-        "-Y", 'tls.handshake.type == 2 or (http.response.code == 101 && http.upgrade == "websocket")'
-    ]
-
-    # Optional raw pcap tee
-    pcap_out = None
-    if save_pcap:
-        os.makedirs(os.path.dirname(os.path.abspath(save_pcap)), exist_ok=True)
-        pcap_out = open(save_pcap, "wb")
-
-    ssh_proc = subprocess.Popen(ssh_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    tshark_proc = subprocess.Popen(
-        tshark_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, bufsize=1
-    )
-
-    detected = threading.Event()
-    timed_out = threading.Event()
-
-    # Forward tcpdump bytes -> tshark stdin (+ tee)
-    def forwarder():
+    def run(self, remote_cmd: str, *, check: bool = True, timeout: Optional[int] = None) -> str:
+        cmd = self._prefix + self._base_ssh + [f"{SSH_USER}@{self.cfg.host}", remote_cmd]
         try:
-            for chunk in iter(lambda: ssh_proc.stdout.read(65536), b""):
-                if not chunk:
+            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=timeout or self.cfg.timeout_s)
+            return out.decode("utf-8", errors="replace")
+        except subprocess.CalledProcessError as e:
+            if check:
+                raise SshError(e.output.decode("utf-8", errors="replace"))
+            return e.output.decode("utf-8", errors="replace")
+        except subprocess.TimeoutExpired as e:
+            raise SshError("SSH command timed out") from e
+
+    def scp_get(self, remote_path: str, local_path: Path) -> None:
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        cmd = self._prefix + self._base_scp + [f"{SSH_USER}@{self.cfg.host}:{remote_path}", str(local_path)]
+        try:
+            subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, timeout=self.cfg.timeout_s)
+        except subprocess.CalledProcessError as e:
+            raise SshError(f"SCP failed: {e}") from e
+
+# ---------- Protect service ops ----------
+class ProtectService:
+    def __init__(self, ssh: SshClient):
+        self.ssh = ssh
+
+    def has_tls_keylog_sentinel(self) -> bool:
+        # Build the remote grep once; no nested f-strings.
+        cmd = f"grep -E '^ExecStart=' {REMOTE_SERVICE} 2>/dev/null || true"
+        quoted = shlex.quote(cmd)
+        out = self.ssh.run(f"sh -lc {quoted}", check=False).strip()
+
+        # If we couldn't read the ExecStart line, play it safe and say "not present".
+        if not out:
+            return False
+
+        # Return True only if the tls keylog flag is on the ExecStart line.
+        return "--tls-keylog" in out
+
+    def patch_execstart_add_tls(self) -> None:
+        # Single script to patch and daemon-reload; idempotent
+        script = f"""set -e
+FILE="{REMOTE_SERVICE}"; TMP="/tmp/unifi-protect.service.$$"
+[ -f "$FILE" ]
+if grep -E '^ExecStart=' "$FILE" | grep -q -- '--tls-keylog'; then
+  systemctl daemon-reload; exit 0
+fi
+awk 'BEGIN{{p=0}} /^ExecStart=/ && /\\/usr\\/bin\\/node20/ && $0 !~ /--tls-keylog/ {{gsub(/\\/usr\\/bin\\/node20/,"/usr/bin/node20 --tls-keylog {REMOTE_KEYLOG}"); p=1}} {{print}} END{{exit (p?0:5)}}' "$FILE" >"$TMP"
+install -m 0644 "$TMP" "$FILE"; rm -f "$TMP"
+systemctl daemon-reload
+"""
+        self.ssh.run(f"sh -lc {shlex.quote(script)}")
+
+    def restart_and_wait(self, timeout_s: int = 60) -> None:
+        self.ssh.run("sh -lc 'systemctl restart unifi-protect'")
+        end = time.time() + timeout_s
+        while time.time() < end:
+            state = self.ssh.run("sh -lc 'systemctl is-active unifi-protect || true'", check=False).strip()
+            if state == "active":
+                return
+            time.sleep(1)
+        raise SshError("unifi-protect did not become active within timeout")
+
+    def wait_keylog_ready(self, settle_s: float = 2.0, timeout_s: float = 60.0) -> bool:
+        """Wait until keylog exists and its size stabilizes for settle_s."""
+        script = f"""\
+if [ -f {REMOTE_KEYLOG} ]; then
+  S=$(stat -c %s {REMOTE_KEYLOG} 2>/dev/null || busybox stat -c %s {REMOTE_KEYLOG} 2>/dev/null || echo 0)
+  echo "$S"
+else
+  echo ""
+fi"""
+        start = time.time()
+        last_size: Optional[int] = None
+        last_change = time.time()
+        while time.time() - start < timeout_s:
+            out = self.ssh.run(f"sh -lc {shlex.quote(script)}", check=False).strip()
+            if out.isdigit():
+                size = int(out)
+                if size > 0:
+                    if last_size is None or size != last_size:
+                        last_size = size
+                        last_change = time.time()
+                    else:
+                        if time.time() - last_change >= settle_s:
+                            return True
+            time.sleep(0.5)
+        return False
+
+# ---------- Hello detection ----------
+@dataclass
+class HelloEvent:
+    reason: str  # "tls_server_hello" or "http_101_upgrade"
+    ts: float = field(default_factory=time.time)
+    port: Optional[int] = None
+    stream_id: Optional[int] = None
+
+class HelloDetector(threading.Thread):
+    """Reads tshark stdout; sets .event when a Hello/Upgrade is detected."""
+    def __init__(self, stdout_pipe, event: threading.Event):
+        super().__init__(daemon=True)
+        self.stdout_pipe = stdout_pipe
+        self.event_flag = event
+        self.event: Optional[HelloEvent] = None
+
+    def run(self) -> None:
+        try:
+            while not self.event_flag.is_set():
+                line = self.stdout_pipe.readline()
+                if not line:
                     break
-                if pcap_out:
-                    pcap_out.write(chunk)
+                text = line.strip()
+                if not text:
+                    continue
+                # Simple heuristic based on Info column
+                if "Server Hello" in text or "ServerHello" in text:
+                    self.event = HelloEvent(reason="tls_server_hello")
+                    self.event_flag.set()
+                    break
+                if "101 Switching Protocols" in text or "Upgrade: websocket" in text or "WebSocket" in text:
+                    self.event = HelloEvent(reason="http_101_upgrade")
+                    self.event_flag.set()
+                    break
+        except Exception:
+            # Don't crash the process on parser issues
+            pass
+
+# ---------- Capture coordinator ----------
+class CaptureCoordinator:
+    def __init__(self, cfg: Config, ssh: SshClient):
+        self.cfg = cfg
+        self.ssh = ssh
+        self.ssh_proc: Optional[subprocess.Popen] = None
+        self.tshark_proc: Optional[subprocess.Popen] = None
+        self.forwarder: Optional[threading.Thread] = None
+        self.hello_seen = threading.Event()
+        self.detector: Optional[HelloDetector] = None
+        self._pcap_path = cfg.save_pcap or (cfg.keylog_dir / "handshake_capture.pcap")
+
+    def _build_bpf(self) -> str:
+        port_expr = " or ".join(f"port {p}" for p in self.cfg.ports)
+        bpf = f"({port_expr})"
+        if self.cfg.camera_ip:
+            bpf += f" and (src host {self.cfg.camera_ip} or dst host {self.cfg.camera_ip})"
+        return bpf
+
+    def start(self) -> None:
+        if not which("tshark"):
+            raise RuntimeError("tshark not found on PATH")
+        bpf = self._build_bpf()
+        tcpdump_cmd = f"sudo tcpdump -U -s0 -i {self.cfg.iface} -w - '{bpf}'"
+        ssh_cmd = self.ssh._prefix + self.ssh._base_ssh + [f"{SSH_USER}@{self.ssh.cfg.host}", f"sh -lc {shlex.quote(tcpdump_cmd)}"]
+
+        decode_args: list[str] = []
+        for p in self.cfg.ports:
+            decode_args += ["-d", f"tcp.port=={p},ssl"]  # decode as TLS for hello detection
+
+        tshark_cmd = ["tshark", "-r", "-", "-l", "-n"] + decode_args + [
+            "-T", "fields", "-e", "_ws.col.Info",
+            "-Y", 'tls.handshake.type == 2 or (http.response.code == 101 && http.upgrade == "websocket")'
+        ]
+
+        self._pcap_path.parent.mkdir(parents=True, exist_ok=True)
+        self.ssh_proc = subprocess.Popen(ssh_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.tshark_proc = subprocess.Popen(
+            tshark_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1
+        )
+        assert self.ssh_proc.stdout and self.tshark_proc.stdin
+
+        # Forwarder: bytes → pcap file + tshark stdin
+        def _forward():
+            with open(self._pcap_path, "wb") as pcap_out:
                 try:
-                    tshark_proc.stdin.buffer.write(chunk)
-                    tshark_proc.stdin.flush()
-                except BrokenPipeError:
-                    break
-        finally:
-            if pcap_out:
-                pcap_out.flush()
-                pcap_out.close()
+                    while True:
+                        chunk = self.ssh_proc.stdout.read(65536)  # type: ignore
+                        if not chunk:
+                            break
+                        pcap_out.write(chunk)
+                        try:
+                            # tshark stdin is text mode; write raw via buffer
+                            self.tshark_proc.stdin.buffer.write(chunk)  # type: ignore[attr-defined]
+                            self.tshark_proc.stdin.flush()
+                        except (BrokenPipeError, ValueError):
+                            break
+                finally:
+                    try:
+                        if self.tshark_proc and self.tshark_proc.stdin:
+                            self.tshark_proc.stdin.close()
+                    except Exception:
+                        pass
+
+        self.forwarder = threading.Thread(target=_forward, daemon=True)
+        self.forwarder.start()
+
+        # Hello detector thread
+        assert self.tshark_proc.stdout
+        self.detector = HelloDetector(self.tshark_proc.stdout, self.hello_seen)
+        self.detector.start()
+
+    def wait_for_hello(self, timeout_s: int) -> Optional[HelloEvent]:
+        if not self.ssh_proc or not self.tshark_proc or not self.detector:
+            raise RuntimeError("Capture not started")
+        if self.hello_seen.wait(timeout_s):
+            return self.detector.event
+        return None
+
+    def stop_gracefully(self) -> None:
+        # Stop tcpdump cleanly on remote with SIGINT to avoid truncation
+        try:
+            pattern = f"tcpdump -U -s0 -i {self.cfg.iface} "
+            self.ssh.run(f"sh -lc {shlex.quote(f'pkill -INT -f {pattern} || true')}", check=False)
+        except Exception:
+            pass
+
+        # Join forwarder
+        try:
+            if self.forwarder:
+                self.forwarder.join(timeout=3)
+        except Exception:
+            pass
+
+        # Tear down local processes
+        for proc in (self.tshark_proc, self.ssh_proc):
+            if not proc:
+                continue
             try:
-                if tshark_proc.stdin:
-                    tshark_proc.stdin.close()
+                proc.terminate()
+                proc.wait(timeout=3)
             except Exception:
-                pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
 
-    threading.Thread(target=forwarder, daemon=True).start()
+    def pcap_path(self) -> Path:
+        return self._pcap_path
 
-    # Simple timeout watchdog
-    def watchdog():
-        if duration and duration > 0:
-            time.sleep(duration)
-            timed_out.set()
+# ---------- Keylog manager (JIT fetch) ----------
+class KeylogManager:
+    def __init__(self, cfg: Config, ssh: SshClient, svc: ProtectService):
+        self.cfg = cfg
+        self.ssh = ssh
+        self.svc = svc
+        self._fetched = False
+        self._local_path: Optional[Path] = None
 
-    threading.Thread(target=watchdog, daemon=True).start()
+    def _build_local_path(self) -> Path:
+        self.cfg.keylog_dir.mkdir(parents=True, exist_ok=True)
+        if self.cfg.keylog_timestamp:
+            return self.cfg.keylog_dir / f"unifiprotectsslkeys_{now_utc_stamp()}.log"
+        return self.cfg.keylog_dir / "unifiprotectsslkeys_latest.log"
 
-    # Watch detector output
-    print("[capture] Waiting for ServerHello or WebSocket Upgrade…")
-    while True:
-        if timed_out.is_set():
-            print("[capture] Timeout reached.")
-            break
-        line = tshark_proc.stdout.readline()
-        if not line:
-            break
-        if line.strip():
-            print(f"[capture] Detected: {line.strip()}")
-            detected.set()
-            break
+    def fetch_once_after_hello(self) -> Path:
+        if self._fetched and self._local_path:
+            return self._local_path
+        # Short settle window to ensure TLS1.3 secrets are written
+        ok = self.svc.wait_keylog_ready(settle_s=self.cfg.settle_keylog_s, timeout_s=60)
+        if not ok:
+            raise SshError("Key log did not appear or settle after handshake")
+        local = self._build_local_path()
+        self.ssh.scp_get(REMOTE_KEYLOG, local)
+        self._fetched = True
+        self._local_path = local
+        return local
 
-    # Grace period to finish current packets if we saw hello
-    if detected.is_set() and post_capture_seconds > 0:
-        time.sleep(post_capture_seconds)
-
-    # Stop tcpdump cleanly on the UDM so the pcap isn't truncated
-    try:
-        pattern = f"tcpdump -U -s0 -i {iface} "
-        # pkill with a safely-quoted pattern
-        stop_cmd = f"pkill -INT -f {shlex.quote(pattern)}"
-        run_ssh(host, f"sh -lc {shlex.quote(stop_cmd)}", port=port, key=key, password_env=password, check=False)
-    except Exception:
-        pass
-
-    # Let processes wind down
-    try:
-        ssh_proc.wait(timeout=3)
-    except Exception:
-        ssh_proc.terminate()
-    try:
-        tshark_proc.wait(timeout=3)
-    except Exception:
-        tshark_proc.terminate()
-
-    print(f"[capture] Done ({'hello seen' if detected.is_set() else 'no hello'}).")
-    return detected.is_set()
-
-def print_first_unifi_jsons(save_pcap_path, keylog_path, decode_as="7442", camera_ip=None,
-                            limit=60, json_only=False, json_out=None,
-                            from_filter=None, to_filter=None):
-    """
-    Discover candidate TLS streams and print up to `limit` JSON messages.
-    If json_only=True, only well-formed JSON objects are emitted.
-    Optional NDJSON sink via `json_out`.
-    """
-    import subprocess, json, re, os, sys
-
-    def run_out(cmd):
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        return proc.stdout  # ignore rc
-
-    base = [
-        "tshark", "-r", save_pcap_path, "-n",
-        "-o", f"tls.keylog_file:{keylog_path}",
-        "-o", "tcp.desegment_tcp_streams:true",
-        "-o", "tls.desegment_ssl_records:true",
-    ]
-    for p in (decode_as.split(",") if decode_as else ["7442"]):
-        p = p.strip()
-        if p.isdigit():
-            base += ["-d", f"tcp.port=={p},tls"]
-
-    def wrap_ip(df):
-        return f"({df}) && ip.addr=={camera_ip}" if camera_ip else df
-
-    discover_filters = [
-        wrap_ip("tls.handshake.type==1 || tls.handshake.type==2"),
-        wrap_ip("ssl.handshake.type==1 || ssl.handshake.type==2"),
-        wrap_ip("tls"), wrap_ip("ssl"),
-    ]
-
-    streams, used_filter, seen = [], None, set()
-    for df in discover_filters:
-        cmd = base + ["-Y", df, "-T", "fields", "-e", "tcp.stream"]
-        out = run_out(cmd)
-        cand = []
-        for line in out.splitlines():
-            s = line.strip()
-            if s.isdigit() and s not in seen:
-                seen.add(s); cand.append(int(s))
-        if cand:
-            streams = cand; used_filter = df; break
-    if not streams:
-        streams = list(range(0, 8))
-        used_filter = "bruteforce(0..7)"
-    print(f"[decode] Candidate streams: {streams} (source={used_filter})")
-
-    # Optional NDJSON sink
-    sink = open(json_out, "w", encoding="utf-8") if json_out else None
-    printed = 0
-
-    # Helper: emit JSON with optional from/to filtering
-    def emit(obj):
-        nonlocal printed
-        if from_filter and obj.get("from") != from_filter:
-            return
-        if to_filter and obj.get("to") != to_filter:
-            return
-        line = json.dumps(obj, ensure_ascii=False)
-        print(line)
-        if sink:
-            sink.write(line + "\n")
-        printed += 1
-
-    # Streaming JSON extractor from follow output
-    brace_re = re.compile(r"[{}]")
-    def scan_follow_text(text):
-        """
-        Yields JSON objects found in text by tracking balanced braces.
-        Strips common framing like '.~.' prefixes before '{'.
-        """
-        buf = []
+# ---------- JSON extraction ----------
+class MessageExtractor:
+    """Brace-balanced JSON scanner with simple framing tolerance."""
+    @staticmethod
+    def scan(text: str) -> Iterator[dict]:
+        buf: list[str] = []
         depth = 0
         for ch in text:
             if depth == 0:
-                # skip visible framing before a JSON object
                 if ch != "{":
                     continue
-                buf = ["{"]; depth = 1; continue
-            # inside object
+                buf = ["{"]
+                depth = 1
+                continue
             buf.append(ch)
             if ch == "{":
                 depth += 1
@@ -479,223 +412,235 @@ def print_first_unifi_jsons(save_pcap_path, keylog_path, decode_as="7442", camer
                 depth -= 1
                 if depth == 0:
                     blob = "".join(buf)
-                    # try JSON decode; ignore failures
                     try:
-                        obj = json.loads(blob)
-                        yield obj
+                        yield json.loads(blob)
                     except Exception:
                         pass
                     buf = []
 
-    for stream in streams:
-        if printed >= limit:
-            break
-        follow_cmd = [
-            "tshark", "-r", save_pcap_path, "-q", "-z", f"follow,tls,ascii,{stream}",
-            "-n",
-            "-o", f"tls.keylog_file:{keylog_path}",
-            "-o", "tcp.desegment_tcp_streams:true",
-            "-o", "tls.desegment_ssl_records:true",
-        ]
-        for p in (decode_as.split(",") if decode_as else ["7442"]):
-            p = p.strip()
-            if p.isdigit():
-                follow_cmd += ["-d", f"tcp.port=={p},tls"]
+# ---------- Decoder ----------
+class Decoder:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
 
-        proc = subprocess.Popen(follow_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        try:
-            # Collect only the data section: everything between the two "====" blocks.
-            collecting = False
-            for line in proc.stdout:
-                if printed >= limit:
-                    break
-                if line.startswith("==================================================================="):
-                    collecting = not collecting
-                    continue
-                if not collecting:
-                    continue
-                if json_only:
-                    for obj in scan_follow_text(line):
-                        emit(obj)
-                        if printed >= limit:
-                            break
-                else:
-                    # old behavior: best-effort inline { ... } extraction
-                    if "{" in line and "}" in line:
+    def _decode_args(self) -> list[str]:
+        args: list[str] = []
+        for p in self.cfg.ports:
+            args += ["-d", f"tcp.port=={p},tls"]
+        return args
+
+    def candidate_streams(self, pcap: Path, keylog: Path) -> list[int]:
+        base = ["tshark", "-r", str(pcap), "-n",
+                "-o", f"tls.keylog_file:{keylog}",
+                "-o", "tcp.desegment_tcp_streams:true",
+                "-o", "tls.desegment_ssl_records:true"] + self._decode_args()
+        # Try to discover streams with TLS presence; fallback to 0..7
+        for df in [
+            "tls.handshake.type==1 || tls.handshake.type==2",
+            "ssl.handshake.type==1 || ssl.handshake.type==2",
+            "tls", "ssl",
+        ]:
+            cmd = base + ["-Y", df, "-T", "fields", "-e", "tcp.stream"]
+            out = subprocess.run(cmd, capture_output=True, text=True).stdout
+            seen = set()
+            streams = []
+            for line in out.splitlines():
+                s = line.strip()
+                if s.isdigit() and s not in seen:
+                    seen.add(s); streams.append(int(s))
+            if streams:
+                return streams
+        return list(range(0, 8))
+
+    def decode_first_messages(self, pcap: Path, keylog: Path, limit: int,
+                              json_only: bool, from_filter: Optional[str], to_filter: Optional[str]) -> Iterator[dict]:
+        streams = self.candidate_streams(pcap, keylog)
+        printed = 0
+        for stream in streams:
+            if printed >= limit:
+                break
+            follow_cmd = [
+                "tshark", "-r", str(pcap), "-q", "-z", f"follow,tls,ascii,{stream}",
+                "-n",
+                "-o", f"tls.keylog_file:{keylog}",
+                "-o", "tcp.desegment_tcp_streams:true",
+                "-o", "tls.desegment_ssl_records:true",
+            ] + self._decode_args()
+            proc = subprocess.Popen(follow_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                collecting = False
+                assert proc.stdout
+                for line in proc.stdout:
+                    if printed >= limit:
+                        break
+                    if line.startswith("==================================================================="):
+                        collecting = not collecting
+                        continue
+                    if not collecting:
+                        continue
+                    if json_only:
+                        for obj in MessageExtractor.scan(line):
+                            if from_filter and obj.get("from") != from_filter:
+                                continue
+                            if to_filter and obj.get("to") != to_filter:
+                                continue
+                            yield obj
+                            printed += 1
+                            if printed >= limit:
+                                break
+                    else:
+                        # Best-effort inline extraction
                         a = line.find("{"); b = line.rfind("}")
-                        if b > a:
+                        if a != -1 and b > a:
                             try:
                                 obj = json.loads(line[a:b+1])
-                                emit(obj)
+                                if from_filter and obj.get("from") != from_filter:
+                                    continue
+                                if to_filter and obj.get("to") != to_filter:
+                                    continue
+                                yield obj
+                                printed += 1
                             except Exception:
                                 pass
+            finally:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+
+# ---------- Sinks ----------
+class MessageSink:
+    def __init__(self, ndjson_path: Optional[Path]):
+        self.path = ndjson_path
+        self._fh = None
+        if self.path:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._fh = open(self.path, "w", encoding="utf-8")
+
+    def write(self, obj: dict) -> None:
+        line = json.dumps(obj, ensure_ascii=False)
+        print(line)
+        if self._fh:
+            self._fh.write(line + "\n")
+
+    def close(self) -> None:
+        if self._fh:
+            self._fh.flush()
+            self._fh.close()
+            self._fh = None
+
+# ---------- Orchestration ----------
+class App:
+    def __init__(self, cfg: Config):
+        password = os.getenv("UFP_ROOT_PASS")
+        self.ssh = SshClient(SshConfig(host=cfg.host, port=cfg.port, key=cfg.key, password=password, timeout_s=120))
+        self.cfg = cfg
+        self.svc = ProtectService(self.ssh)
+        self.keymgr = KeylogManager(cfg, self.ssh, self.svc)
+        self.decoder = Decoder(cfg)
+
+    def run_full_once(self) -> int:
+        # 1) optional service patch (idempotent)
+        if self.cfg.do_patch and not self.svc.has_tls_keylog_sentinel():
+            print("[svc] Patching ExecStart with --tls-keylog …")
+            self.svc.patch_execstart_add_tls()
+            print("[svc] Restarting Protect …")
+            self.svc.restart_and_wait(timeout_s=60)
+        else:
+            print("[svc] TLS keylog already present or patching disabled.")
+
+        # 2) start capture
+        cap = CaptureCoordinator(self.cfg, self.ssh)
+        print("[capture] Starting remote tcpdump + local hello detector …")
+        cap.start()
+
+        # 3) wait for hello
+        event = cap.wait_for_hello(self.cfg.capture_timeout_s)
+        if not event:
+            print("[capture] Timeout waiting for TLS ServerHello/HTTP 101 Upgrade.")
+        else:
+            print(f"[capture] Detected handshake: {event.reason}")
+
+        # 4) stop capture (graceful)
+        if event:
+            time.sleep(max(0, self.cfg.post_grace_s))  # allow a few more packets
+        cap.stop_gracefully()
+        pcap_path = cap.pcap_path()
+        print(f"[capture] PCAP saved → {pcap_path}")
+
+        # 5) JIT fetch keylog (after hello)
+        if not event:
+            print("[fetch] Skipping keylog fetch (no hello detected).")
+            return 2
+        print("[fetch] Waiting for key log to settle and fetching once …")
+        keylog_local = self.keymgr.fetch_once_after_hello()
+        print(f"[fetch] Key log saved → {keylog_local}")
+
+        # 6) Decode & print first messages
+        print(f"[decode] Extracting up to {self.cfg.msg_limit} JSON messages …")
+        sink = MessageSink(self.cfg.json_out)
+        try:
+            count = 0
+            for obj in self.decoder.decode_first_messages(
+                pcap_path,
+                keylog_local,
+                limit=self.cfg.msg_limit,
+                json_only=self.cfg.json_only,
+                from_filter=self.cfg.from_filter,
+                to_filter=self.cfg.to_filter,
+            ):
+                sink.write(obj)
+                count += 1
+            print(f"[decode] Printed {count} JSON messages.")
         finally:
-            proc.terminate()
+            sink.close()
 
-    if sink:
-        sink.close()
-    print(f"[decode] Printed {printed} JSON messages.")
-    return printed
+        return 0
 
-# ---- main flow ----
-def main():
-    ap = argparse.ArgumentParser(description="Ensure TLS keylog patch, refresh keylog, and fetch it.")
+# ---------- CLI ----------
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(description="Unified multi-port TLS capture with JIT key fetch & JSON decode (single-file).")
     ap.add_argument("--host", required=True, help="UDM/UDM SE IP/hostname")
     ap.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
     ap.add_argument("--key", default=None, help="SSH private key (optional)")
-    ap.add_argument("--keylog-dir", required=True, help="Local directory to store key log")
-    # legacy alias (hidden)
-    ap.add_argument("--timestamp", action="store_true", help=argparse.SUPPRESS)
-    # preferred flag
-    ap.add_argument("--keylog-timestamp", action="store_true", help="Save with UTC timestamped filename")
+    ap.add_argument("--keylog-dir", default="./protect_artifacts", help="Local directory to store key log & artifacts")
+    ap.add_argument("--keylog-timestamp", action="store_true", help="Save key log with UTC timestamp in filename")
 
-    # optional live capture
-    ap.add_argument("--capture-after", action="store_true",
-                    help="After fetching the fresh keylog, start a live capture until ServerHello/Upgrade is seen")
     ap.add_argument("--iface", default="br0", help="Remote capture interface (default: br0)")
     ap.add_argument("--camera-ip", default="", help="Optional camera IP to narrow capture")
     ap.add_argument("--decode-as", default="7442", help="Comma-separated ports to decode as TLS (default: 7442)")
-    ap.add_argument("--capture-timeout", type=int, default=60, help="Max seconds to wait for hello (default: 60)")
-    ap.add_argument("--save-pcap", default="", help="Optional path to save live capture stream (e.g. ./protect_artifacts/handshake_capture.pcap)")
-    ap.add_argument("--json-only", action="store_true", help="Print only valid JSON objects from decrypted streams")
-    ap.add_argument("--json-out", default="", help="Optional path to write NDJSON of decoded messages")
-    ap.add_argument("--msg-limit", type=int, default=60, help="Max number of JSON messages to print (default: 60)")
-    ap.add_argument("--from-filter", default="", help='Only keep messages with this "from" value (e.g. UniFiVideo)')
-    ap.add_argument("--to-filter", default="", help='Only keep messages with this "to" value (e.g. ubnt_avclient)')
+    ap.add_argument("--capture-timeout", type=int, default=60, help="Seconds to wait for hello (default: 60)")
+    ap.add_argument("--save-pcap", default="", help="Optional output pcap path (default: keylog-dir/handshake_capture.pcap)")
 
+    ap.add_argument("--json-only", action="store_true", help="Print only valid JSON objects")
+    ap.add_argument("--json-out", default="", help="Optional NDJSON output path")
+    ap.add_argument("--msg-limit", type=int, default=60, help="Max JSON messages to print")
+    ap.add_argument("--from-filter", default="", help='Only keep messages with this "from" value')
+    ap.add_argument("--to-filter", default="", help='Only keep messages with this "to" value')
+
+    ap.add_argument("--no-patch", action="store_true", help="Do not patch/restart unifi-protect (assume already patched)")
+    return ap
+
+def main() -> int:
+    ap = build_parser()
     args = ap.parse_args()
-    if args.timestamp:
-        args.keylog_timestamp = True  # back-compat alias
-
-    host     = args.host
-    port     = args.port
-    key_path = args.key
-
-    # Auth env: prefer UFP_ROOT_PASS
-    password_env = os.getenv("UFP_ROOT_PASS")
-    if password_env:
-        print("[auth] Using password from environment (UFP_ROOT_PASS).")
-        if not which("sshpass"):
-            print("[auth] Note: 'sshpass' not found; ssh/scp will still prompt if password is required.")
-
-    # 1) Ensure service is patched
-    present, _ = has_tls_sentinel(host, REMOTE_SERVICE, port=port, key=key_path, password_env=password_env)
-    if not present:
-        print("[svc] Patching ExecStart with --tls-keylog …")
-        patch_execstart_to_add_tls(host, port=port, key=key_path, password_env=password_env)
-        daemon_reload(host, port=port, key=key_path, password_env=password_env)
-    else:
-        print("[svc] TLS keylog already present in ExecStart.")
-
-    # 2) Pre-restart snapshot (may exist if Protect is running)
-    pre = remote_stat_keylog(host, port=port, key=key_path, password_env=password_env)
-    print(f"[remote-pre] exists={pre['exists']} size={pre['size']} hash={pre['sha256'][:12]}…")
-
-    # 3) Latest local
-    latest_local = find_latest_local_path(args.keylog_dir)
-    have_local = bool(latest_local)
-    print(f"[local] have_local={'YES' if have_local else 'NO'} path={latest_local or '-'}")
-
-    # 4) Always rotate remote file to avoid append/dupes
-    if pre["exists"]:
-        print("[remote] deleting existing /tmp keylog before restart to avoid append/dupes …")
-        remove_remote_file(host, REMOTE_KEYLOG, port=port, key=key_path, password_env=password_env)
-
-    # (optionally remove stale local if present so we always keep only the newest)
-    if have_local:
-        try:
-            os.remove(latest_local)
-            print(f"[local] deleted stale file: {latest_local}")
-        except Exception:
-            pass
-
-    # ---- NEW: start capture first, then restart ----
-    hello_seen = False
-    if args.capture_after:
-        save_pcap_path = args.save_pcap or os.path.join(args.keylog_dir, "handshake_capture.pcap")
-        # start capture in a background thread and give it ~1s head start
-        print("[capture] priming live capture before restart …")
-        def do_capture():
-            nonlocal hello_seen
-            hello_seen = capture_until_hello(
-                host=host, port=port, key=key_path, password=password_env,
-                iface=args.iface, camera_ip=(args.camera_ip or None),
-                duration=args.capture_timeout, keylog_path=None,   # keylog not needed to detect hello
-                save_pcap=save_pcap_path, decode_as=args.decode_as,
-                post_capture_seconds=8
-            )
-        import threading, time as _time
-        tcap = threading.Thread(target=do_capture, daemon=True)
-        tcap.start()
-        _time.sleep(1.0)  # let tcpdump reach “listening on”
-
-    # 5) Restart + wait active
-    print("[svc] restarting unifi-protect …")
-    run_ssh(host, "sh -lc 'systemctl daemon-reload; systemctl restart unifi-protect'",
-            port=port, key=key_path, password_env=password_env, check=True)
-    print("[svc] waiting for service to become active …")
-    if not wait_service_active(host, port=port, key=key_path, password_env=password_env, timeout_s=60):
-        print("[svc] ERROR: service did not become active within timeout.")
-        return 3
-
-    # 6) Wait for keylog to be recreated & settled; post snapshot
-    post = wait_keylog_recreated_and_settled(host, port=port, key=key_path, password_env=password_env,
-                                             min_wait=1, settle_window=2, timeout_s=60)
-    if not post["exists"]:
-        print("[fetch] ERROR: keylog did not reappear after restart.")
-        return 4
-    print(f"[remote-post] size={post['size']} hash={post['sha256'][:12]}…")
-
-    # 7) Download
-    local_path = build_local_path(args.keylog_dir, getattr(args, "keylog_timestamp", False))
-    scp_download(host, REMOTE_KEYLOG, local_path, port=port, key=key_path, password_env=password_env)
-    print(f"[fetch] downloaded keylog to: {local_path}")
-
-    # 8) Verify
-    ok = same_hash(local_path, post["sha256"])
-    print(f"[verify] local hash matches remote (post-restart)? {'YES' if ok else 'NO'}")
-
-    # 9) Optional live capture until Hello
-    if args.capture_after:
-        save_pcap_path = args.save_pcap or os.path.join(args.keylog_dir, "handshake_capture.pcap")
-
-        capture_until_hello(
-            host=host,
-            port=port,
-            key=key_path,
-            password=password_env,
-            iface=args.iface,
-            camera_ip=(args.camera_ip or None),
-            duration=args.capture_timeout,
-            keylog_path=local_path,
-            save_pcap=save_pcap_path,
-            decode_as=args.decode_as,
-        )
-
-        # ---- Re-download keylog to ensure latest secrets ----
-        post_log = os.path.join(args.keylog_dir, "unifiprotectsslkeys_after_capture.log")
-        scp_download(host, REMOTE_KEYLOG, post_log, port=port, key=key_path, password_env=password_env)
-        print(f"[fetch] re-downloaded keylog after capture → {post_log}")
-
-        # ---- Decrypt and show first 60 UniFi messages (multi-stream aware) ----
-        print("[decode] Extracting and printing first 60 decrypted UniFi messages across TLS streams…")
-        print_first_unifi_jsons(
-            save_pcap_path,
-            post_log,
-            decode_as=args.decode_as,
-            camera_ip=(args.camera_ip or None),
-            limit=args.msg_limit,
-            json_only=args.json_only,
-            json_out=args.json_out or None,
-            from_filter=(args.from_filter or None),
-            to_filter=(args.to_filter or None),
-        )
-
-    return 0 if ok else 5
-
-if __name__ == "__main__":
+    cfg = Config.from_cli(args)
+    app = App(cfg)
     try:
-        sys.exit(main())
+        return app.run_full_once()
     except KeyboardInterrupt:
         print("Interrupted.")
-        sys.exit(130)
+        return 130
+    except SshError as e:
+        print(str(e).rstrip())
+        return 2
+    except RuntimeError as e:
+        print(f"ERROR: {e}")
+        return 1
+
+if __name__ == "__main__":
+    sys.exit(main())
