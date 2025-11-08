@@ -1,16 +1,108 @@
 #!/usr/bin/env python3
 """
-ufp_capture_refactor.py  —  single-file, class-based refactor
+dev_parser_unifi_protect_messages.py — UniFi Protect stream decoder with live de-duplication
 
-End-state goals implemented:
-- One remote tcpdump (multi-port BPF), streamed to local
-- Local tshark detects first TLS ServerHello or HTTP 101 Upgrade
-- Fetch TLS key log **only after** hello (TLS 1.3 friendly), with brief settle
-- Decode JSON messages from decrypted streams (balanced-brace extractor)
-- No file hashing; no repeated key pulls (optional refresh hook left for future)
-- Safer process lifecycle; fewer SSH round-trips via batched shell snippets
+Overview
+========
+This script automates **remote packet capture, TLS key retrieval, and JSON message decoding**
+from UniFi Protect (UDM/UDM-SE). It can run in two modes:
 
-Requires: ssh/scp, (optionally) sshpass, tcpdump on remote, tshark locally.
+1) Offline mode (default)
+   - SSH to controller → start remote tcpdump (multi-port BPF)
+   - Detect TLS ServerHello or HTTP 101 Upgrade
+   - Fetch `/tmp/unifiprotectsslkeys.log`
+   - Stop capture and decode decrypted payloads to JSON via tshark
+
+2) Online (live-unique) mode (`--live-unique`)
+   - Keeps remote tcpdump running
+   - After handshake + keylog fetch, starts a decrypting monitor that tails the growing PCAP
+   - Extracts JSON continuously and **de-duplicates by functionName** (fallback to content hash)
+   - Prints a 5-second summary of new vs deduped counts
+
+Key Features
+============
+- No local tcpdump required (capture runs remotely over SSH)
+- TLS 1.3 friendly: keylog is fetched only **after** a fresh handshake
+- Multi-port support (e.g., 7441, 7442, 7445, 7550)
+- Robust JSON extraction from decrypted WSS/HTTP(S) data
+- Append-safe NDJSON output for long runs (24h+)
+- 5-second live stats for quick health checks
+
+Service & Camera Restarts
+=========================
+What the script restarts (controller side)
+------------------------------------------
+- If `unifi-protect.service`'s ExecStart does **not** include `--tls-keylog <path>`,
+  the script patches the unit file and runs:
+    `systemctl daemon-reload` and `systemctl restart unifi-protect`
+- This restart is **idempotent** and only happens when needed (unless you pass `--no-patch`).
+- Impact: a brief Protect outage; cameras will disconnect and then automatically reconnect,
+  performing **new TLS handshakes** that write secrets to the keylog file.
+
+When you may need to restart the camera (device side)
+-----------------------------------------------------
+- If you start a capture **after** a camera already has a long-lived TLS session and you
+  never see a new handshake (no “ServerHello” within `--capture-timeout`), you need a fresh
+  TLS handshake from that camera. Options:
+  - Reboot the camera (Protect UI → Manage → Restart / or power cycle)
+  - Temporarily disconnect/reconnect the camera network port
+  - Disable/enable the camera in Protect UI (forces re-connect in many cases)
+- Other times you might restart the camera:
+  - You changed monitored ports or routing and the camera didn't re-establish WSS/HTTPS
+  - You want to force immediate renegotiation to resume decryption after topology changes
+- If you prefer **not** to disrupt video, just re-run the script and let it wait for the camera's
+  next natural reconnect; it will fetch keys only after it observes a fresh handshake.
+
+Safety notes
+------------
+- Restarting `unifi-protect.service` briefly interrupts recording/alerts; do during a maintenance window.
+- Use `--no-patch` to avoid any controller restarts if you've already added `--tls-keylog` permanently.
+- The script only fetches the keylog **after** it detects a handshake and a brief settle period, ensuring
+  TLS 1.3 secrets are present.
+
+Typical Usage
+=============
+# --- One-shot offline decode (short run) ---
+./dev_parser_unifi_protect_messages.py \
+  --host 192.168.0.1 \
+  --iface br0 \
+  --camera-ip 192.168.0.151 \
+  --decode-as 7442,7441,7445,7550 \
+  --json-only \
+  --msg-limit 200 \
+  --json-out ./protect_artifacts/messages.ndjson
+
+# --- Continuous online monitor (live-unique) ---
+./dev_parser_unifi_protect_messages.py \
+  --host 192.168.0.1 \
+  --iface br0 \
+  --camera-ip 192.168.0.151 \
+  --decode-as 7442,7441,7445,7550 \
+  --live-unique \
+  --json-only \
+  --json-out ./protect_artifacts/unique_live.ndjson \
+  --msg-limit 0 \
+  --dedupe-window 200000
+
+Optional Flags
+==============
+--no-patch
+    Skip TLS keylog patch/restart if you've already enabled it.
+--info-filter 'tls.record.content_type==23'
+    Reduce chatter to application data (safer than tcp.segment_data).
+--capture-timeout 60
+    How long to wait for first handshake before giving up (offline) or continuing (live).
+--debug-live-raw 8
+    Print the first 8 raw live lines from tshark for quick debugging.
+
+Requirements
+============
+- Remote: tcpdump on the UDM/UDM-SE
+- Local: tshark + ssh/scp (sshpass optional for password auth)
+
+Author
+======
+Refactored single-file capture and parser tool for UniFi Protect WSS message decoding.
 """
 
 from __future__ import annotations
@@ -18,14 +110,15 @@ import argparse
 import json
 import os
 import shlex
-import signal
 import subprocess
 import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Iterator, Optional, Tuple
+from typing import Iterator, Optional, Tuple, List, Set, Deque
+from collections import deque
+import hashlib
 
 # ---------- Constants ----------
 SSH_USER = "root"
@@ -61,6 +154,10 @@ class Config:
     to_filter: Optional[str] = None
     do_patch: bool = True
     settle_keylog_s: float = 2.0  # wait for TLS 1.3 secrets to flush
+    live_unique: bool = False
+    dedupe_window: int = 100_000  # approx number of recent unique entries to remember
+    info_filter: Optional[str] = None  # extra -Y display filter for live monitor (optional)
+    debug_live_raw: int = 0  # if >0, print this many raw tshark lines in live mode
 
     @staticmethod
     def from_cli(args: argparse.Namespace) -> "Config":
@@ -83,6 +180,10 @@ class Config:
             from_filter=(args.from_filter or None),
             to_filter=(args.to_filter or None),
             do_patch=(not args.no_patch),
+            live_unique=args.live_unique,
+            dedupe_window=args.dedupe_window,
+            info_filter=(args.info_filter or None),
+            debug_live_raw=args.debug_live_raw,
         )
 
 # ---------- SSH client ----------
@@ -152,20 +253,14 @@ class ProtectService:
         self.ssh = ssh
 
     def has_tls_keylog_sentinel(self) -> bool:
-        # Build the remote grep once; no nested f-strings.
         cmd = f"grep -E '^ExecStart=' {REMOTE_SERVICE} 2>/dev/null || true"
         quoted = shlex.quote(cmd)
         out = self.ssh.run(f"sh -lc {quoted}", check=False).strip()
-
-        # If we couldn't read the ExecStart line, play it safe and say "not present".
         if not out:
             return False
-
-        # Return True only if the tls keylog flag is on the ExecStart line.
         return "--tls-keylog" in out
 
     def patch_execstart_add_tls(self) -> None:
-        # Single script to patch and daemon-reload; idempotent
         script = f"""set -e
 FILE="{REMOTE_SERVICE}"; TMP="/tmp/unifi-protect.service.$$"
 [ -f "$FILE" ]
@@ -239,7 +334,6 @@ class HelloDetector(threading.Thread):
                 text = line.strip()
                 if not text:
                     continue
-                # Simple heuristic based on Info column
                 if "Server Hello" in text or "ServerHello" in text:
                     self.event = HelloEvent(reason="tls_server_hello")
                     self.event_flag.set()
@@ -249,7 +343,6 @@ class HelloDetector(threading.Thread):
                     self.event_flag.set()
                     break
         except Exception:
-            # Don't crash the process on parser issues
             pass
 
 # ---------- Capture coordinator ----------
@@ -280,7 +373,8 @@ class CaptureCoordinator:
 
         decode_args: list[str] = []
         for p in self.cfg.ports:
-            decode_args += ["-d", f"tcp.port=={p},ssl"]  # decode as TLS for hello detection
+            # map to TLS for hello detection
+            decode_args += ["-d", f"tcp.port=={p},tls"]
 
         tshark_cmd = ["tshark", "-r", "-", "-l", "-n"] + decode_args + [
             "-T", "fields", "-e", "_ws.col.Info",
@@ -305,7 +399,6 @@ class CaptureCoordinator:
                             break
                         pcap_out.write(chunk)
                         try:
-                            # tshark stdin is text mode; write raw via buffer
                             self.tshark_proc.stdin.buffer.write(chunk)  # type: ignore[attr-defined]
                             self.tshark_proc.stdin.flush()
                         except (BrokenPipeError, ValueError):
@@ -340,14 +433,12 @@ class CaptureCoordinator:
         except Exception:
             pass
 
-        # Join forwarder
         try:
             if self.forwarder:
                 self.forwarder.join(timeout=3)
         except Exception:
             pass
 
-        # Tear down local processes
         for proc in (self.tshark_proc, self.ssh_proc):
             if not proc:
                 continue
@@ -363,7 +454,7 @@ class CaptureCoordinator:
     def pcap_path(self) -> Path:
         return self._pcap_path
 
-# ---------- Keylog manager (JIT fetch) ----------
+# ---------- Keylog manager ----------
 class KeylogManager:
     def __init__(self, cfg: Config, ssh: SshClient, svc: ProtectService):
         self.cfg = cfg
@@ -381,7 +472,6 @@ class KeylogManager:
     def fetch_once_after_hello(self) -> Path:
         if self._fetched and self._local_path:
             return self._local_path
-        # Short settle window to ensure TLS1.3 secrets are written
         ok = self.svc.wait_keylog_ready(settle_s=self.cfg.settle_keylog_s, timeout_s=60)
         if not ok:
             raise SshError("Key log did not appear or settle after handshake")
@@ -396,7 +486,7 @@ class MessageExtractor:
     """Brace-balanced JSON scanner with simple framing tolerance."""
     @staticmethod
     def scan(text: str) -> Iterator[dict]:
-        buf: list[str] = []
+        buf: List[str] = []
         depth = 0
         for ch in text:
             if depth == 0:
@@ -418,7 +508,7 @@ class MessageExtractor:
                         pass
                     buf = []
 
-# ---------- Decoder ----------
+# ---------- Decoder (offline) ----------
 class Decoder:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -434,7 +524,6 @@ class Decoder:
                 "-o", f"tls.keylog_file:{keylog}",
                 "-o", "tcp.desegment_tcp_streams:true",
                 "-o", "tls.desegment_ssl_records:true"] + self._decode_args()
-        # Try to discover streams with TLS presence; fallback to 0..7
         for df in [
             "tls.handshake.type==1 || tls.handshake.type==2",
             "ssl.handshake.type==1 || ssl.handshake.type==2",
@@ -489,7 +578,6 @@ class Decoder:
                             if printed >= limit:
                                 break
                     else:
-                        # Best-effort inline extraction
                         a = line.find("{"); b = line.rfind("}")
                         if a != -1 and b > a:
                             try:
@@ -512,6 +600,217 @@ class Decoder:
                     except Exception:
                         pass
 
+# ---------- Live monitor: replay + follow a growing PCAP ----------
+class LiveJsonMonitor:
+    """
+    Starts a decrypting tshark that reads from stdin (-r -).
+    A feeder thread streams bytes from the growing PCAP file starting at byte 0,
+    then keeps following new bytes as the file grows.
+    We parse tshark stdout in near-real time, extract JSON, and de-duplicate by functionName.
+
+    Prints a 5s summary: "new" (written) vs "deduped" (filtered), plus running totals.
+    """
+    def __init__(self, cfg: Config, pcap_path: Path, keylog_path: Path):
+        self.cfg = cfg
+        self.pcap_path = pcap_path
+        self.keylog_path = keylog_path
+        self.tshark: Optional[subprocess.Popen] = None
+        self.feeder: Optional[threading.Thread] = None
+        self.stop_ev = threading.Event()
+
+        # de-dup window (approximate): keep last N distinct function names (or hashes when no fn)
+        self.seen_window: int = cfg.dedupe_window
+        self.seen_funcs: Set[str] = set()
+        self.seen_q: Deque[str] = deque()
+
+        # stats
+        self.stats_interval_s = 5.0
+        self.total_new = 0
+        self.total_deduped = 0
+        self.last_report_ts = time.time()
+        self.w_new_5s = 0
+        self.w_deduped_5s = 0
+
+        self.sink = MessageSink(self.cfg.json_out)
+
+    def _remember(self, fn_or_hash: str) -> None:
+        self.seen_funcs.add(fn_or_hash)
+        self.seen_q.append(fn_or_hash)
+        if len(self.seen_q) > self.seen_window:
+            old = self.seen_q.popleft()
+            self.seen_funcs.discard(old)
+
+    def _decode_args(self) -> list[str]:
+        args: list[str] = []
+        for p in self.cfg.ports:
+            args += ["-d", f"tcp.port=={p},tls"]
+        return args
+
+    def _maybe_report(self, force: bool = False) -> None:
+        now = time.time()
+        if force or (now - self.last_report_ts) >= self.stats_interval_s:
+            print(f"[live/stats] +{int(now - self.last_report_ts)}s: "
+                  f"new={self.w_new_5s}, deduped={self.w_deduped_5s} | "
+                  f"totals: new={self.total_new}, deduped={self.total_deduped}, "
+                  f"unique_keys={len(self.seen_funcs)}")
+            self.last_report_ts = now
+            self.w_new_5s = 0
+            self.w_deduped_5s = 0
+
+    def start(self) -> None:
+        # tshark reading from stdin; read decrypted application data
+        tshark_cmd = [
+            "tshark", "-r", "-", "-l", "-n",
+            "-o", f"tls.keylog_file:{self.keylog_path}",
+            "-o", "tcp.desegment_tcp_streams:true",
+            "-o", "tls.desegment_ssl_records:true",
+        ] + self._decode_args()
+
+        if self.cfg.info_filter:
+            tshark_cmd += ["-Y", self.cfg.info_filter]
+
+        # Ask for several likely payload fields; tab-separate columns explicitly
+        tshark_cmd += [
+            "-T", "fields", "-E", "separator=\t",
+            "-e", "tcp.segment_data",  # hex (often populated)
+            "-e", "data.text",         # printable
+            "-e", "data.data",         # hex (common on some builds)
+            "-e", "tls.app_data",      # hex (sometimes here)
+        ]
+
+        self.tshark = subprocess.Popen(
+            tshark_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,  # stdout is text; stdin will use .buffer for binary
+            bufsize=1
+        )
+        assert self.tshark.stdin and self.tshark.stdout
+
+        # Feeder thread: stream PCAP bytes to tshark stdin, then follow growth
+        def _feeder():
+            try:
+                with open(self.pcap_path, "rb") as f:
+                    while not self.stop_ev.is_set():
+                        chunk = f.read(1024 * 256)
+                        if chunk:
+                            try:
+                                self.tshark.stdin.buffer.write(chunk)  # type: ignore[attr-defined]
+                                self.tshark.stdin.flush()
+                            except (BrokenPipeError, ValueError):
+                                break
+                            continue
+                        time.sleep(0.25)  # wait for file to grow
+            finally:
+                try:
+                    if self.tshark and self.tshark.stdin:
+                        self.tshark.stdin.close()
+                except Exception:
+                    pass
+
+        self.feeder = threading.Thread(target=_feeder, daemon=True)
+        self.feeder.start()
+
+        # Consumer thread: parse tshark stdout for JSON, de-dup, and report stats
+        def _consumer():
+            try:
+                assert self.tshark and self.tshark.stdout
+                count = 0
+                dbg_left = max(0, int(self.cfg.debug_live_raw))
+                for raw_line in self.tshark.stdout:
+                    if self.stop_ev.is_set():
+                        break
+                    if dbg_left > 0:
+                        print(f"[live/raw] {raw_line[:200]!r}")
+                        dbg_left -= 1
+
+                    line = raw_line.rstrip("\n")
+                    if not line:
+                        self._maybe_report()
+                        continue
+
+                    cols = line.split("\t")  # [seg_hex, text, data_hex, app_hex]
+                    chunks: List[str] = []
+
+                    # text column as-is
+                    if len(cols) > 1 and cols[1]:
+                        chunks.append(cols[1])
+
+                    # decode hex-ish columns
+                    for idx in (0, 2, 3):
+                        if idx < len(cols):
+                            s = cols[idx].strip()
+                            if s and len(s) % 2 == 0 and all(c in "0123456789abcdefABCDEF" for c in s):
+                                try:
+                                    chunks.append(bytes.fromhex(s).decode("utf-8", "ignore"))
+                                except Exception:
+                                    pass
+
+                    wrote_any = False
+                    deduped_here = 0
+
+                    for chunk in chunks:
+                        for obj in MessageExtractor.scan(chunk):
+                            if self.cfg.from_filter and obj.get("from") != self.cfg.from_filter:
+                                continue
+                            if self.cfg.to_filter and obj.get("to") != self.cfg.to_filter:
+                                continue
+
+                            fn = obj.get("functionName")
+                            key: str
+                            if fn:
+                                key = f"fn:{fn}"
+                            else:
+                                blob = json.dumps(obj, sort_keys=True, ensure_ascii=False)
+                                key = "h:" + hashlib.sha1(blob.encode("utf-8")).hexdigest()
+
+                            if key in self.seen_funcs:
+                                deduped_here += 1
+                                continue
+
+                            self._remember(key)
+                            self.sink.write(obj)
+                            wrote_any = True
+                            self.total_new += 1
+                            self.w_new_5s += 1
+                            count += 1
+                            if self.cfg.msg_limit and count >= self.cfg.msg_limit:
+                                self.stop_ev.set()
+                                break
+                        if self.stop_ev.is_set():
+                            break
+
+                    self.total_deduped += deduped_here
+                    self.w_deduped_5s += deduped_here
+
+                    # periodic stats line every ~5s
+                    self._maybe_report()
+
+                # final report on exit
+                self._maybe_report(force=True)
+            finally:
+                self.sink.close()
+
+        threading.Thread(target=_consumer, daemon=True).start()
+
+    def stop(self) -> None:
+        self.stop_ev.set()
+        try:
+            if self.feeder:
+                self.feeder.join(timeout=2)
+        except Exception:
+            pass
+        if self.tshark:
+            try:
+                self.tshark.terminate()
+                self.tshark.wait(timeout=3)
+            except Exception:
+                try:
+                    self.tshark.kill()
+                except Exception:
+                    pass
+
 # ---------- Sinks ----------
 class MessageSink:
     def __init__(self, ndjson_path: Optional[Path]):
@@ -519,19 +818,22 @@ class MessageSink:
         self._fh = None
         if self.path:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self._fh = open(self.path, "w", encoding="utf-8")
+            self._fh = open(self.path, "a", encoding="utf-8")  # append for long runs
 
     def write(self, obj: dict) -> None:
         line = json.dumps(obj, ensure_ascii=False)
         print(line)
         if self._fh:
             self._fh.write(line + "\n")
+            self._fh.flush()
 
     def close(self) -> None:
         if self._fh:
-            self._fh.flush()
-            self._fh.close()
-            self._fh = None
+            try:
+                self._fh.flush()
+                self._fh.close()
+            finally:
+                self._fh = None
 
 # ---------- Orchestration ----------
 class App:
@@ -553,7 +855,7 @@ class App:
         else:
             print("[svc] TLS keylog already present or patching disabled.")
 
-        # 2) start capture
+        # 2) start capture (remote tcpdump → local hello detector, and tee to file)
         cap = CaptureCoordinator(self.cfg, self.ssh)
         print("[capture] Starting remote tcpdump + local hello detector …")
         cap.start()
@@ -565,22 +867,48 @@ class App:
         else:
             print(f"[capture] Detected handshake: {event.reason}")
 
-        # 4) stop capture (graceful)
-        if event:
-            time.sleep(max(0, self.cfg.post_grace_s))  # allow a few more packets
-        cap.stop_gracefully()
         pcap_path = cap.pcap_path()
-        print(f"[capture] PCAP saved → {pcap_path}")
+        print(f"[capture] PCAP (growing) → {pcap_path}")
 
-        # 5) JIT fetch keylog (after hello)
         if not event:
+            cap.stop_gracefully()
             print("[fetch] Skipping keylog fetch (no hello detected).")
             return 2
+
+        # 4) allow a few more packets (optional)
+        if self.cfg.post_grace_s > 0:
+            time.sleep(self.cfg.post_grace_s)
+
+        # 5) JIT fetch keylog (after hello)
         print("[fetch] Waiting for key log to settle and fetching once …")
         keylog_local = self.keymgr.fetch_once_after_hello()
         print(f"[fetch] Key log saved → {keylog_local}")
 
-        # 6) Decode & print first messages
+        # 6) If live-unique: start live decrypt monitor (keep tcpdump running!)
+        if self.cfg.live_unique:
+            if not self.cfg.json_out:
+                print("ERROR: --live-unique requires --json-out to write NDJSON.")
+                cap.stop_gracefully()
+                return 1
+            print("[live] Starting decrypting live monitor (replay + follow) …")
+            monitor = LiveJsonMonitor(self.cfg, pcap_path, keylog_local)
+            monitor.start()
+            try:
+                # Run until msg_limit reached or interrupted
+                while True:
+                    if monitor.stop_ev.is_set():
+                        break
+                    time.sleep(0.5)
+            except KeyboardInterrupt:
+                print("[live] Interrupted; stopping …")
+            finally:
+                monitor.stop()
+                cap.stop_gracefully()
+            return 0
+
+        # 7) Else: stop capture and decode offline once
+        cap.stop_gracefully()
+
         print(f"[decode] Extracting up to {self.cfg.msg_limit} JSON messages …")
         sink = MessageSink(self.cfg.json_out)
         try:
@@ -623,6 +951,13 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--to-filter", default="", help='Only keep messages with this "to" value')
 
     ap.add_argument("--no-patch", action="store_true", help="Do not patch/restart unifi-protect (assume already patched)")
+
+    # Live mode options
+    ap.add_argument("--live-unique", action="store_true", help="After hello+keylog, decrypt and stream only UNIQUE JSON messages (replay+follow PCAP).")
+    ap.add_argument("--dedupe-window", type=int, default=100_000, help="Approximate number of recent unique items to remember (default: 100k).")
+    ap.add_argument("--info-filter", default="", help="Optional tshark -Y display filter for live monitor (e.g., 'tls.record.content_type==23').")
+    ap.add_argument("--debug-live-raw", type=int, default=0, help="Print this many raw lines from live tshark for debugging.")
+
     return ap
 
 def main() -> int:
