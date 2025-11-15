@@ -9,13 +9,20 @@ def setup_logger(name="camera_app", level=logging.DEBUG):
     logger = logging.getLogger(name)
     logger.setLevel(level)
 
-    if not logger.handlers:
-        handler = logging.StreamHandler(sys.stdout)
-        formatter = logging.Formatter(
-            "%(asctime)s [%(threadName)s] [%(levelname)s] %(name)s: %(message)s",
-            "%Y-%m-%d %H:%M:%S"
-        )
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
+    if logger.handlers:
+        return logger
+
+    root_logger = logging.getLogger()
+    if logger is not root_logger and root_logger.handlers:
+        logger.propagate = True
+        return logger
+
+    handler = logging.StreamHandler(sys.stdout)
+    formatter = logging.Formatter(
+        "%(asctime)s [%(threadName)s] [%(levelname)s] %(name)s: %(message)s",
+        "%Y-%m-%d %H:%M:%S"
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
 
     return logger
