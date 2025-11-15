@@ -1,12 +1,14 @@
-import os
-import ssl
-import threading
-import subprocess
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import asyncio
 import json
 import logging
-from typing import Optional
+import os
+import secrets
+import ssl
+import subprocess
+import threading
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Optional, Tuple
 
 from utils.logging_utils import setup_logger
 from camera_data.camera_settings import CameraSettings
@@ -33,18 +35,21 @@ class VerboseAPIServer:
         keyfile: str = "key.pem",
         settings: Optional[CameraSettings] = None,
         logger: Optional[logging.Logger] = None,
-        token_event: threading.Event | None = None
+        token_event: threading.Event | None = None,
+        driver=None,
     ):
         self.port = port
         self.use_ssl = use_ssl
         self.certfile = certfile
         self.keyfile = keyfile
         self.token_event = token_event
+        self.driver = driver
         # If no logger provided, default to DEBUG so you see request logs
         self.logger = logger or setup_logger("api_https", logging.DEBUG)
 
         # Use the provided settings or create a new one
         self.settings: CameraSettings = settings or CameraSettings()
+        self._last_session_cookie = None
 
         # Inject api_server instance into handler via factory
         def handler_factory(*args, **kwargs):
@@ -67,16 +72,53 @@ class VerboseAPIServer:
             self.log = api_server.logger
             super().__init__(request, client_address, server)
 
+        @staticmethod
+        def _jpeg_dimensions(data: bytes) -> Tuple[Optional[int], Optional[int]]:
+            if len(data) < 4 or data[0] != 0xFF or data[1] != 0xD8:
+                return (None, None)
+            i = 2
+            while i + 3 < len(data):
+                if data[i] != 0xFF:
+                    i += 1
+                    continue
+                marker = data[i + 1]
+                i += 2
+                if marker in (0xD8, 0xD9):
+                    continue
+                if i + 1 >= len(data):
+                    break
+                seglen = (data[i] << 8) | data[i + 1]
+                if seglen < 2 or i + seglen > len(data):
+                    break
+                if 0xC0 <= marker <= 0xC3 and seglen >= 7:
+                    height = (data[i + 3] << 8) | data[i + 4]
+                    width = (data[i + 5] << 8) | data[i + 6]
+                    return (width, height)
+                i += seglen
+            return (None, None)
+
         # ----------------- helpers -----------------
 
-        def _send_json(self, data, status: int = 200):
+        def _send_json(self, data, status: int = 200, headers: Optional[dict] = None):
             self.send_response(status)
             # 204 should not include a body; we’ll skip writing data then,
             # but sending Content-Type is harmless.
             self.send_header("Content-Type", "application/json")
+            if headers:
+                for key, value in headers.items():
+                    self.send_header(key, value)
             self.end_headers()
             if status != 204:
                 self.wfile.write(json.dumps(data).encode())
+
+        def _read_body(self) -> bytes:
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                length = 0
+            if length <= 0:
+                return b""
+            return self.rfile.read(length)
 
         def log_request_info(self):
             self.log.info("📌 Incoming Request Headers:")
@@ -96,17 +138,20 @@ class VerboseAPIServer:
         # ----------------- HTTP methods -----------------
 
         def do_POST(self):
-            if self.path != "/api/1.2/manage":
-                self._send_json({"error": "Not Found"}, 404)
+            if self.path == "/api/1.2/manage":
+                self._handle_manage_post()
                 return
+            if self.path == "/api/1.2/login":
+                self._handle_login_post()
+                return
+            if self.path == "/api/1.2/snapshot":
+                self._serve_snapshot()
+                return
+            self._send_json({"error": "Not Found"}, 404)
 
+        def _handle_manage_post(self):
             self.log_request_info()
-
-            try:
-                length = int(self.headers.get("Content-Length", 0))
-            except ValueError:
-                length = 0
-            body = self.rfile.read(length)
+            body = self._read_body()
 
             try:
                 data = json.loads(body)
@@ -202,7 +247,62 @@ class VerboseAPIServer:
             self.log.info(json.dumps(resp, indent=2))
             self._send_json(resp, 200)
 
+        def _handle_login_post(self):
+            self.log_request_info()
+            body = self._read_body()
+            parsed = {}
+            if body:
+                try:
+                    parsed = json.loads(body)
+                except Exception:
+                    self.log.debug("Login payload not JSON (len=%d)", len(body))
+            if parsed:
+                self.log.info("🔐 Login payload: %s", json.dumps(parsed, indent=2))
+            cookie_val = secrets.token_hex(16)
+            self.api_server._last_session_cookie = cookie_val
+            headers = {"Set-Cookie": f"TOKEN={cookie_val}; Path=/; HttpOnly"}
+            resp = {"status": "ok", "uniqueId": self.api_server.settings.get("mac") or ""}
+            self._send_json(resp, 200, headers=headers)
+
+        def _serve_snapshot(self):
+            driver = self.api_server.driver
+            if driver is None:
+                self._send_json({"error": "snapshot driver unavailable"}, 503)
+                return
+
+            parsed_path = self.path.split("?", 1)[0]
+            self.log.info("📸 Snapshot request via %s", parsed_path)
+
+            try:
+                jpeg = asyncio.run(driver.get_snapshot_jpeg(timeout_s=3))
+            except Exception as exc:
+                self.log.error("Snapshot capture failed: %s", exc)
+                self._send_json({"error": "snapshot capture failed"}, 500)
+                return
+            width, height = self._jpeg_dimensions(jpeg)
+            self.log.info(
+                "📸 Snapshot ready bytes=%d dims=%sx%s (fallback HTTP)",
+                len(jpeg),
+                width or "?",
+                height or "?",
+            )
+
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+            if width:
+                self.send_header("X-Image-Width", str(width))
+            if height:
+                self.send_header("X-Image-Height", str(height))
+            self.send_header("Content-Length", str(len(jpeg)))
+            self.end_headers()
+            self.wfile.write(jpeg)
+
         def do_GET(self):
+            if self.path.startswith("/api/1.2/snapshot"):
+                self._serve_snapshot()
+                return
             s = self.api_server.settings
             self._send_json(
                 {

@@ -4,6 +4,7 @@ from api_server import VerboseAPIServer
 from utils.logging_utils import setup_logger
 from utils.uptime_utils import increment_uptime
 from Unifi.wss_manager import WssManager
+from Unifi.drivers.camera_factory import build_camera_driver
 import threading, time, logging, signal
 from Unifi.upload_server import start_upload_server
 
@@ -22,6 +23,8 @@ def main():
     disc_log_level = settings.get("logging.discovery.level", logging.INFO)
     wss_log_level = settings.get("logging.wss.level", logging.INFO)
     upload_server_log_level = settings.get("logging.upload_server.level", logging.INFO)
+    wss_log = setup_logger("wss", wss_log_level)
+    driver = build_camera_driver(settings, wss_log)
 
     # Uptime seed
     now_ms = int(time.time() * 1000)
@@ -45,7 +48,14 @@ def main():
 
     # API server (passes token_event so it can .set() when token arrives)
     api_log = setup_logger("api_https", api_log_level)
-    api_server = VerboseAPIServer(port=443, use_ssl=True, settings=settings, logger=api_log, token_event=token_event)
+    api_server = VerboseAPIServer(
+        port=443,
+        use_ssl=True,
+        settings=settings,
+        logger=api_log,
+        token_event=token_event,
+        driver=driver,
+    )
     threading.Thread(target=api_server.start, daemon=True, name="APIServerThread").start()
     api_log.info("HTTPS API server started on port 443")
 
@@ -54,8 +64,7 @@ def main():
     start_upload_server(logger=upload_server_log)
 
     # WSS manager (waits for token/host)
-    wss_log = setup_logger("wss", wss_log_level)
-    wss_mgr = WssManager(settings, token_event, stop_event, wss_log)
+    wss_mgr = WssManager(settings, token_event, stop_event, wss_log, driver=driver)
     wss_mgr.start()
 
     # Shutdown handling

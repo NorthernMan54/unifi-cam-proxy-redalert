@@ -12,4 +12,4 @@ def build_camera_driver(settings: Dict[str, Any], log) -> CameraDriver:
         return AmcrestDriver(amc, log)
     # elif brand == "hikvision": return HikvisionDriver(...)
     # elif brand == "reolink": return ReolinkDriver(...)
-    return NullDriver({}, log)
+    return NullDriver(settings, log)
