@@ -99,10 +99,12 @@ class WssManager(threading.Thread):
                     "ChangeAnalyticsSettings": self._on_change_analytics_settings,
                     "ChangeDeviceSettings": self._on_change_device_settings,
                     "UpdateUsernamePassword": self._on_update_username_password,
-        
+                    "ChangeClarityZones": self._on_change_clarity_zones,
+
                     # Misc
                     "AnalyticsTest": self._on_analytics_test,
                     "GetRequest": self._on_get_request,   # snapshot
+                    "UpdateFaceDBRequest": self._on_update_face_db_request,
                 }
 
     # --------- log filtering + throttling helpers ---------
@@ -376,6 +378,23 @@ class WssManager(threading.Thread):
             # e.g. name/timezone/analyticsMode — echo back is fine
             await self._reply(ws, msg, {
                 "statusCode": 0, "status": "ok", "deviceID": self._device_id(), **incoming
+            })
+
+    async def _on_change_clarity_zones(self, ws, msg, expect: bool):
+        if expect:
+            incoming = msg.get("payload") or {}
+            await self._reply(ws, msg, {
+                "statusCode": 0, "status": "ok", "deviceID": self._device_id(), **incoming
+            })
+
+    async def _on_update_face_db_request(self, ws, msg, expect: bool):
+        if expect:
+            payload = msg.get("payload") or {}
+            await self._reply(ws, msg, {
+                "statusCode": 0,
+                "status": "ok",
+                "deviceID": self._device_id(),
+                **payload,
             })
 
     async def _on_update_username_password(self, ws, msg, expect: bool):
