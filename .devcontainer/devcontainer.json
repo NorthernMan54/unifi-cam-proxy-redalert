@@ -2,20 +2,29 @@
   "name": "Unifi Cam Proxy Dev",
   "image": "mcr.microsoft.com/devcontainers/python:3.11",
   "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+
   "customizations": {
     "vscode": {
       "extensions": ["ms-python.python"]
     }
   },
+
   "runArgs": [
     "--network=lan_net"
   ],
+
   "mounts": [
     "source=/etc/localtime,target=/etc/localtime,type=bind,readonly",
     "source=/etc/timezone,target=/etc/timezone,type=bind,readonly"
   ],
-  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y ffmpeg iputils-ping && pip install -r requirements.txt",
+
   "containerEnv": {
     "CAMERA_MODEL": "UVC_G4_DOME"
-  }
+  },
+
+  "postCreateCommand": [
+    "bash",
+    "-lc",
+    "set -e && sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ffmpeg iputils-ping curl ca-certificates tar tshark openssh-client && pip install -r requirements.txt"
+  ]
 }
