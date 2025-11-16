@@ -21,16 +21,26 @@ Environment knobs (set before running python):
   export WSS_DISABLE_SECURE_TRANSFER=true      # skip secure_transfer subprotocol
 """
 
+# Debug tip: on the UniFi Protect controller, run `tail -f /volume1/.srv/unifi-protect/logs/cameras.log` to watch camera logs live.
+
+# TODO (Protect interoperability backlog):
+# - ChangeSmartMotionSettings: accept/ack enhanced motion config (sample payload sanitized from debug log).
+# - SmartMotionTest: respond to linger test probes (sample payload sanitized, only contains lingerTestStopSec).
+# - ChangeAudioEventsSettings: persist audio alarm enable flags (payload enumerates enableAlrm* booleans).
+# - ChangeSmartDetectSettings: store/respond to smart detect profile + region/zones (payload sanitized; includes region code and zone maps).
+
 from __future__ import annotations
 
 import asyncio
 import copy
+import io
 import json
 import logging
 import os
 import ssl
 import threading
 import time
+import subprocess
 import uuid
 from collections import deque
 from urllib.parse import urlparse
@@ -41,6 +51,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Iterable, Optional, Tuple
 
 import hashlib
+from PIL import Image
 import websockets  # type: ignore
 from websockets.client import WebSocketClientProtocol  # type: ignore
 from websockets.exceptions import ConnectionClosed  # type: ignore
@@ -535,6 +546,18 @@ class MaintenanceHandlers(BaseHandlers):
         out = self.protocol.build_reply(msg, payload)
         await self.protocol.send(ws, out)
 
+    async def on_stop_service(self, ws: WebSocketClientProtocol, msg: ControllerMessage):
+        incoming = msg.payload if isinstance(msg.payload, dict) else {}
+        self._persist_incoming_payload(msg.function_name, incoming)
+        if msg.expects_response():
+            await self._reply_ok(ws, msg, incoming)
+
+    async def on_enable_logging(self, ws: WebSocketClientProtocol, msg: ControllerMessage):
+        incoming = msg.payload if isinstance(msg.payload, dict) else {}
+        self._persist_incoming_payload(msg.function_name, incoming)
+        if msg.expects_response():
+            await self._reply_ok(ws, msg, incoming)
+
 
 class SettingsHandlers(BaseHandlers):
     async def on_change_osd_settings(self, ws: WebSocketClientProtocol, msg: ControllerMessage):
@@ -562,9 +585,9 @@ class SettingsHandlers(BaseHandlers):
             await self._reply_ok(ws, msg, incoming)
 
     async def on_change_device_settings(self, ws: WebSocketClientProtocol, msg: ControllerMessage):
+        incoming = msg.payload if isinstance(msg.payload, dict) else {}
+        self._persist_incoming_payload(msg.function_name, incoming)
         if msg.expects_response():
-            incoming = msg.payload if isinstance(msg.payload, dict) else {}
-            self._persist_incoming_payload(msg.function_name, incoming)
             await self._reply_ok(ws, msg, incoming)
 
     async def on_change_clarity_zones(self, ws: WebSocketClientProtocol, msg: ControllerMessage):
@@ -576,6 +599,12 @@ class SettingsHandlers(BaseHandlers):
     async def on_update_username_password(self, ws: WebSocketClientProtocol, msg: ControllerMessage):
         if msg.expects_response():
             await self._reply_ok(ws, msg)
+
+    async def on_audio_agent_change_tuning(self, ws: WebSocketClientProtocol, msg: ControllerMessage):
+        incoming = msg.payload if isinstance(msg.payload, dict) else {}
+        self._persist_incoming_payload(msg.function_name, incoming)
+        if msg.expects_response():
+            await self._reply_ok(ws, msg, incoming)
 
     async def on_change_video_settings(self, ws: WebSocketClientProtocol, msg: ControllerMessage):
         payload = self._coerce_payload_to_dict(msg.payload)
@@ -703,6 +732,12 @@ class SettingsHandlers(BaseHandlers):
 
 
 class SnapshotHandlers(BaseHandlers):
+    SNAPSHOT_TARGETS = {
+        "low": (480, 270),
+        "medium": (640, 360),
+        "high": (1280, 720),
+    }
+
     @staticmethod
     def _jpeg_dimensions(data: bytes) -> Tuple[Optional[int], Optional[int]]:
         if len(data) < 4 or data[0] != 0xFF or data[1] != 0xD8:
@@ -728,6 +763,24 @@ class SnapshotHandlers(BaseHandlers):
             i += seglen
         return (None, None)
 
+    def _snapshot_target_dimensions(self, quality: Optional[str]) -> Optional[Tuple[int, int]]:
+        if not quality:
+            return None
+        target = self.SNAPSHOT_TARGETS.get(str(quality).lower())
+        if not target:
+            return None
+        return target
+
+    def _resize_snapshot(self, jpeg: bytes, target: Tuple[int, int]) -> bytes:
+        width, height = target
+        buf = io.BytesIO(jpeg)
+        with Image.open(buf) as img:
+            img = img.convert("RGB")
+            resized = img.resize((width, height), Image.LANCZOS)
+            out = io.BytesIO()
+            resized.save(out, format="JPEG", quality=90)
+            return out.getvalue()
+
     async def on_get_request(self, ws: WebSocketClientProtocol, msg: ControllerMessage):
         payload = msg.payload or {}
         if not isinstance(payload, dict) or payload.get("what") != "snapshot":
@@ -747,11 +800,22 @@ class SnapshotHandlers(BaseHandlers):
                 width, height = self._jpeg_dimensions(jpeg)
             except Exception:
                 pass
+            quality = payload.get("quality")
+            target_dims = self._snapshot_target_dimensions(quality)
+            if target_dims and (width, height) != target_dims:
+                try:
+                    jpeg = self._resize_snapshot(jpeg, target_dims)
+                    width, height = target_dims
+                except Exception as exc:
+                    self.log.warning("Snapshot resize to %sx%s failed: %s", target_dims[0], target_dims[1], exc)
+                    try:
+                        width, height = self._jpeg_dimensions(jpeg)
+                    except Exception:
+                        pass
             if self.protocol.config.snapshot_debug:
                 self._snapshot_debug_write(jpeg)
             if not uri:
                 raise ValueError("snapshot URI missing")
-            quality = payload.get("quality")
             self.log.debug(
                 "Snapshot preparing upload: uri=%s quality=%s bytes=%d dims=%sx%s",
                 uri,
@@ -778,76 +842,82 @@ class SnapshotHandlers(BaseHandlers):
         quality: Optional[str] = None,
         dims: Tuple[Optional[int], Optional[int]] = (None, None),
     ):
-        from urllib import error as url_error, request as url_request
-
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
+        start = time.monotonic()
         cert_path = Path("cert.pem")
         key_path = Path("key.pem")
         has_cert = cert_path.exists() and key_path.exists()
-        if has_cert:
-            try:
-                ctx.load_cert_chain(str(cert_path), str(key_path))
-            except Exception as exc:
-                self.log.warning("Snapshot upload: failed to load cert/key: %s", exc)
-
-        boundary = "------------------------" + uuid.uuid4().hex[:16]
-        form_headers = [
-            f"--{boundary}",
-            'Content-Disposition: form-data; name="payload"; filename="snapshot.jpg"',
-            "Content-Type: image/jpeg",
-            "",
+        snapshot_dir = self.protocol.config.snapshot_debug_dir
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        snapshot_path = snapshot_dir / f"snapshot_upload_{uuid.uuid4().hex}.jpg"
+        snapshot_path.write_bytes(jpeg)
+        curl_cmd = [
+            "curl",
+            "-sS",
+            "-k",
+            "-X",
+            "POST",
+            "--fail",
+            "--show-error",
+            "--form",
+            f"payload=@{snapshot_path}",
+            uri,
         ]
-        form_footer = [f"--{boundary}--", ""]
-        body = "\r\n".join(form_headers).encode("utf-8") + jpeg + "\r\n".join(form_footer).encode("utf-8")
-
-        parsed = urlparse(uri)
-        host_header = parsed.netloc or ""
-        if not host_header and parsed.hostname:
-            host_header = parsed.hostname
-            if parsed.port:
-                host_header += f":{parsed.port}"
-
-        req = url_request.Request(uri, data=body, method="POST")
-        if host_header:
-            req.add_header("Host", host_header)
-        req.add_header("Accept", "*/*")
-        req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
-        req.add_header("Content-Length", str(len(body)))
-        req.add_header("Expect", "100-continue")
-
+        if has_cert:
+            curl_cmd.extend(["--cert", str(cert_path), "--key", str(key_path)])
         try:
-            opener = url_request.build_opener(url_request.HTTPSHandler(context=ctx))
-            resp = await asyncio.to_thread(opener.open, req, timeout=timeout_s)
-            code = getattr(resp, "code", None)
+            proc = await asyncio.to_thread(
+                subprocess.run,
+                curl_cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+            )
+            elapsed = max(time.monotonic() - start, 1e-3)
+            success = proc.returncode == 0
+            if not success:
+                self.log.error(
+                    "Snapshot upload curl failed (rc=%s) stdout=%s stderr=%s",
+                    proc.returncode,
+                    proc.stdout.strip(),
+                    proc.stderr.strip(),
+                )
+            mbps = (len(jpeg) * 8) / elapsed / 1_000_000
             self.log.debug(
-                "Snapshot upload HTTP status=%s (len=%d) quality=%s dims=%sx%s uri=%s",
-                code,
+                "Snapshot upload curl rc=%s (len=%d) quality=%s dims=%sx%s uri=%s elapsed=%.3fs rate=%.2f Mbps",
+                proc.returncode,
                 len(jpeg),
                 quality or "?",
                 dims[0] or "?",
                 dims[1] or "?",
                 uri,
+                elapsed,
+                mbps,
             )
-            payload = {"deviceID": self._device_id()}
-            if code in (200, 204):
-                payload.update({"statusCode": 0, "status": "ok"})
+            payload: Dict[str, Any] = {}
+            dims_payload: Dict[str, Any] = {}
+            if dims[0] is not None:
+                dims_payload["width"] = dims[0]
+            if dims[1] is not None:
+                dims_payload["height"] = dims[1]
+            if dims_payload:
+                payload["payload"] = dims_payload
+            if success:
+                payload.update({"statusCode": 0})
             else:
                 payload.update({"statusCode": 1, "status": "error"})
             out = self.protocol.build_reply(in_msg, payload)
             await self.protocol.send(ws, out)
-        except url_error.URLError as exc:
-            self.log.error("Snapshot upload failed: %s", exc)
-            payload = {"statusCode": 1, "status": "error", "deviceID": self._device_id()}
-            out = self.protocol.build_reply(in_msg, payload)
-            await self.protocol.send(ws, out)
         except Exception as exc:
-            self.log.error("Snapshot upload exception: %s", exc)
-            payload = {"statusCode": 1, "status": "error", "deviceID": self._device_id()}
+            elapsed = max(time.monotonic() - start, 1e-3)
+            self.log.error("Snapshot upload exception in %.3fs (%s bytes): %s", elapsed, len(jpeg), exc)
+            payload = {"statusCode": 1, "status": "error"}
             out = self.protocol.build_reply(in_msg, payload)
             await self.protocol.send(ws, out)
+        finally:
+            try:
+                snapshot_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     def _snapshot_debug_write(self, jpeg: bytes):
         try:
@@ -884,6 +954,8 @@ def build_handler_registry(settings, driver, logger: logging.Logger, protocol: "
     reg.register("ubnt_avclient_timeSync", maint.on_time_sync)
     reg.register("GetSystemStats", maint.on_get_system_stats)
     reg.register("NetworkStatus", maint.on_network_status)
+    reg.register("StopService", maint.on_stop_service)
+    reg.register("EnableLogging", maint.on_enable_logging)
 
     reg.register("ChangeVideoSettings", sets.on_change_video_settings)
     reg.register("ChangeIspSettings", sets.on_change_isp_settings)
@@ -894,6 +966,7 @@ def build_handler_registry(settings, driver, logger: logging.Logger, protocol: "
     reg.register("ChangeDeviceSettings", sets.on_change_device_settings)
     reg.register("UpdateUsernamePassword", sets.on_update_username_password)
     reg.register("ChangeClarityZones", sets.on_change_clarity_zones)
+    reg.register("AudioAgentChangeTuning", sets.on_audio_agent_change_tuning)
 
     reg.register("GetRequest", snap.on_get_request)
 
