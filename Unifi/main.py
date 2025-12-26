@@ -19,6 +19,17 @@ def main():
 
     # Logging levels from settings (with sane fallbacks)
     main_log = setup_logger("main", settings.get("logging.main.level", logging.INFO))
+    
+    # Log network configuration details
+    main_log.info("=" * 60)
+    main_log.info("Network Configuration:")
+    main_log.info(f"  IP Address: {settings.get('host', 'NOT SET')}")
+    main_log.info(f"  MAC Address: {settings.get('mac', 'NOT SET')}")
+    main_log.info(f"  Platform: {settings.get('platform', 'NOT SET')}")
+    main_log.info(f"  Firmware Version: {settings.get('firmwareVersion', 'NOT SET')}")
+    main_log.info(f"  Can Adopt: {settings.get('canAdopt', True)}")
+    main_log.info("=" * 60)
+    
     api_log_level = settings.get("logging.api.level", logging.DEBUG)
     disc_log_level = settings.get("logging.discovery.level", logging.INFO)
     wss_log_level = settings.get("logging.wss.level", logging.INFO)

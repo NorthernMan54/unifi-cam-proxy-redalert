@@ -7,7 +7,7 @@ ffmpeg
 fastapi
 uvicorn
 zeroconf
-websockets
+websockets>=12.0
 flask
 cryptography
 Pillow
