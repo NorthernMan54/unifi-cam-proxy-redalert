@@ -19,6 +19,7 @@ Environment knobs (set before running python):
   export WSS_CAPTURE_UNIQUE=false              # capture every message (even duplicates)
   export WSS_CAPTURE_UNIQUE_LIMIT=500          # how many hashes to keep for dedupe
   export WSS_DISABLE_SECURE_TRANSFER=true      # skip secure_transfer subprotocol
+  export PERSIST_LAST_RECEIVED=false           # disable saving lastReceived.* to settings.json
 """
 
 # Debug tip: on the UniFi Protect controller, run `tail -f /volume1/.srv/unifi-protect/logs/cameras.log` to watch camera logs live.
@@ -488,7 +489,7 @@ class WssConfig:
     capture_unique: bool = True
     capture_unique_limit: int = 1000
     snapshot_debug: bool = False
-    snapshot_debug_dir: Path = Path("/workspaces/unifi-cam-proxy/debug_snaps")
+    snapshot_debug_dir: Path = Path("/workspace/Unifi/debug_snaps")
     snapshot_debug_keep: int = 5
 
     @staticmethod
@@ -813,6 +814,12 @@ class BaseHandlers:
             self.settings.update(payload)
         except Exception:
             self.log.exception("Failed to apply payload for %s", fn)
+        
+        # Check if persisting lastReceived messages is disabled
+        persist_last_received = os.getenv("PERSIST_LAST_RECEIVED", "true").lower() not in {"false", "0", "no"}
+        if not persist_last_received:
+            return
+        
         try:
             self.settings.update({f"lastReceived.{fn}": payload})
         except Exception:
@@ -878,6 +885,46 @@ class MaintenanceHandlers(BaseHandlers):
         incoming = msg.payload if isinstance(msg.payload, dict) else {}
         self._persist_incoming_payload(msg.function_name, incoming)
         if msg.expects_response():
+            await self._reply_ok(ws, msg, incoming)
+
+    async def on_update_firmware_request(self, ws: WebSocketClientProtocol, msg: ControllerMessage):
+        incoming = msg.payload if isinstance(msg.payload, dict) else {}
+        self._persist_incoming_payload(msg.function_name, incoming)
+        
+        # Extract version from the URI (e.g., version=5.1.190)
+        uri = incoming.get("uri", "")
+        new_version = None
+        if "version=" in uri:
+            try:
+                # Parse version from URI query string
+                from urllib.parse import urlparse, parse_qs
+                parsed = urlparse(uri)
+                query_params = parse_qs(parsed.query)
+                if "version" in query_params:
+                    new_version = query_params["version"][0]
+            except Exception as exc:
+                self.log.warning("Failed to parse version from URI: %s", exc)
+        
+        # Update the firmware version to match what the controller expects
+        current_version = self.settings.get("firmwareVersion", "unknown")
+        if new_version:
+            try:
+                self.settings["firmwareVersion"] = new_version
+                self.log.info(
+                    "Firmware version updated: %s -> %s (from controller request)",
+                    current_version,
+                    new_version
+                )
+            except Exception as exc:
+                self.log.error("Failed to update firmwareVersion setting: %s", exc)
+        else:
+            self.log.info(
+                "Firmware update request (proxy mode): uri=%s (version not parsed)",
+                uri
+            )
+        
+        if msg.expects_response():
+            # Reply with success to prevent controller from retrying
             await self._reply_ok(ws, msg, incoming)
 
 
@@ -1375,6 +1422,7 @@ def build_handler_registry(settings, driver, logger: logging.Logger, protocol: "
     reg.register("NetworkStatus", maint.on_network_status)
     reg.register("StopService", maint.on_stop_service)
     reg.register("EnableLogging", maint.on_enable_logging)
+    reg.register("UpdateFirmwareRequest", maint.on_update_firmware_request)
 
     reg.register("ChangeVideoSettings", sets.on_change_video_settings)
     reg.register("ChangeIspSettings", sets.on_change_isp_settings)

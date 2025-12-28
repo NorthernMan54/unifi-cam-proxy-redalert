@@ -10,6 +10,7 @@ ENV CAMERA_MODEL=UVC_G4_DOME
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y \
     ffmpeg \
+    netcat-openbsd \
     iputils-ping \
     curl \
     ca-certificates \

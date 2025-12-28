@@ -95,6 +95,12 @@ class CameraSettings:
 
     def _update_latest_firmware_version(self, status="GA"):
         """Set settings['firmwareVersion'] to the latest version string (e.g., '5.1.34')."""
+        # Only fetch and update if firmwareVersion is not already set
+        existing_version = self.settings.get("firmwareVersion")
+        if existing_version:
+            self.logger.info("Using existing firmware version: %s (skipping API fetch)", existing_version)
+            return False
+        
         try:
             info = self._fetch_latest_camera_firmware_api(status=status)
             if not info or not info.get("version"):

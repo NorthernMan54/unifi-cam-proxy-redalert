@@ -18,6 +18,14 @@ services:
     # Environment variables
     environment:
       - CAMERA_MODEL=UVC_G4_DOME
+      # Set to 'false' to prevent cluttering settings.json with lastReceived messages
+      - PERSIST_LAST_RECEIVED=false
+      # FFmpeg arguments for video streaming (matches working unifi-cam-proxy-kinda command)
+      # -c:v copy: Copy video stream without re-encoding (fast, efficient)
+      # -an: Disable audio (Frigate re-streams may not have audio or it may cause sync issues)
+      - FFMPEG_ARGS=-c:v copy -an
+      # Video streaming method: 'pipeline' (unifi-cam-proxy-kinda style) or 'direct' (current)
+      - VIDEO_STREAM_METHOD=pipeline
     
     # Mount source code for live development
     volumes:
@@ -50,3 +58,4 @@ services:
 networks:
   lan_net:
     external: true
+
